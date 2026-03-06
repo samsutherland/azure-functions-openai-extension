@@ -669,6 +669,94 @@ public class DefaultAssistantServiceTests
             assistantService.PostMessageAsync(attributeNoId, CancellationToken.None));
     }
 
+    [Fact]
+    public void TrimMessagesForContextBudget_WithLongHistory_TrimsToEffectiveBudget()
+    {
+        // Arrange
+        const int effectiveBudget = 128000 - 1024 - 4000;
+        const string assistantId = "testId";
+
+        var assistantService = new DefaultAssistantService(
+            this.mockOpenAIClientFactory.Object,
+            this.mockAzureComponentFactory.Object,
+            this.mockConfiguration.Object,
+            this.mockSkillInvoker.Object,
+            this.mockLoggerFactory.Object);
+
+        List<ChatMessageTableEntity> messages = new()
+        {
+            new ChatMessageTableEntity(assistantId, 1, "System instructions", ChatMessageRole.System)
+        };
+
+        for (int i = 0; i < 45; i++)
+        {
+            ChatMessageRole role = i % 2 == 0 ? ChatMessageRole.User : ChatMessageRole.Assistant;
+            messages.Add(new ChatMessageTableEntity(assistantId, i + 2, new string('x', 12000), role));
+        }
+
+        messages.Add(new ChatMessageTableEntity(assistantId, messages.Count + 1, "latest-user-message", ChatMessageRole.User));
+
+        System.Reflection.MethodInfo? trimMethod = typeof(DefaultAssistantService).GetMethod(
+            "TrimMessagesForContextBudget",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        System.Reflection.MethodInfo? estimateMethod = typeof(DefaultAssistantService).GetMethod(
+            "EstimateRequestTokens",
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+
+        Assert.NotNull(trimMethod);
+        Assert.NotNull(estimateMethod);
+
+        // Act
+        var trimmedMessages = (List<ChatMessageTableEntity>)trimMethod!.Invoke(assistantService, [assistantId, messages])!;
+        int estimatedTokens = (int)estimateMethod!.Invoke(null, [trimmedMessages])!;
+
+        // Assert
+        Assert.True(estimatedTokens <= effectiveBudget);
+        Assert.True(trimmedMessages.Count < messages.Count);
+    }
+
+    [Fact]
+    public void TrimMessagesForContextBudget_WithLongHistory_RetainsNewestUserMessage()
+    {
+        // Arrange
+        const string assistantId = "testId";
+        const string latestUserMessage = "do not remove me";
+
+        var assistantService = new DefaultAssistantService(
+            this.mockOpenAIClientFactory.Object,
+            this.mockAzureComponentFactory.Object,
+            this.mockConfiguration.Object,
+            this.mockSkillInvoker.Object,
+            this.mockLoggerFactory.Object);
+
+        List<ChatMessageTableEntity> messages = new()
+        {
+            new ChatMessageTableEntity(assistantId, 1, "System instructions", ChatMessageRole.System)
+        };
+
+        for (int i = 0; i < 40; i++)
+        {
+            ChatMessageRole role = i % 2 == 0 ? ChatMessageRole.User : ChatMessageRole.Assistant;
+            messages.Add(new ChatMessageTableEntity(assistantId, i + 2, new string('y', 10000), role));
+        }
+
+        messages.Add(new ChatMessageTableEntity(assistantId, messages.Count + 1, latestUserMessage, ChatMessageRole.User));
+
+        System.Reflection.MethodInfo? trimMethod = typeof(DefaultAssistantService).GetMethod(
+            "TrimMessagesForContextBudget",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+
+        Assert.NotNull(trimMethod);
+
+        // Act
+        var trimmedMessages = (List<ChatMessageTableEntity>)trimMethod!.Invoke(assistantService, [assistantId, messages])!;
+        ChatMessageTableEntity newestUser = trimmedMessages.Last(m =>
+            string.Equals(m.Role, ChatMessageRole.User.ToString(), StringComparison.OrdinalIgnoreCase));
+
+        // Assert
+        Assert.Equal(latestUserMessage, newestUser.Content);
+    }
+
     static Mock<IConfigurationSection> CreateMockSection(bool exists, string? tableServiceUri = null)
     {
         var mockSection = new Mock<IConfigurationSection>();
