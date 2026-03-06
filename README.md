@@ -1,3 +1,16 @@
+Custom fork used by Streeka.
+
+Additional changes:
+- Allow updating assistant instructions without resetting chat history
+- Fix context length handling
+
+NuGet published to:
+https://nuget.pkg.github.com/samsutherland
+Package:
+Streeka.Azure.WebJobs.Extensions.OpenAI
+
+
+
 # Azure Functions bindings for OpenAI's GPT engine
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
