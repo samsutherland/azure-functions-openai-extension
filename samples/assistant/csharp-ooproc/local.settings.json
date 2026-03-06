@@ -7,6 +7,6 @@
     "CosmosDatabaseName": "todoDB",
     "CosmosContainerName": "myTasks",
     "AZURE_OPENAI_ENDPOINT": "https://extension-reset-resource.cognitiveservices.azure.com/",
-    "CHAT_MODEL_DEPLOYMENT_NAME": "gpt-4o"
+    "CHAT_MODEL_DEPLOYMENT_NAME": "gpt-5-chat"
   }
 }
