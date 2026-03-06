@@ -28,6 +28,11 @@ class DefaultAssistantService : IAssistantService
     /// This number must be small enough to ensure we never exceed a batch size of 100.
     /// </summary>
     const int FunctionCallBatchLimit = 50;
+    const int MaxContextTokens = 128000;
+    const int ReservedForResponseTokens = 1024;
+    const int ReservedForFunctionTokens = 4000;
+    const int ApproximateCharsPerToken = 4;
+    const int MessageTokenOverhead = 12;
     const string DefaultChatStorage = "AzureWebJobsStorage";
     readonly OpenAIClientFactory openAIClientFactory;
     readonly IAssistantSkillInvoker skillInvoker;
@@ -68,68 +73,21 @@ class DefaultAssistantService : IAssistantService
         // Create the table if it doesn't exist
         await tableClient.CreateIfNotExistsAsync();
 
-        // Check to see if the assistant has already been initialized
-        AsyncPageable<TableEntity> queryResultsFilter = tableClient.QueryAsync<TableEntity>(
-            filter: $"PartitionKey eq '{request.Id}'",
-            cancellationToken: cancellationToken);
-
-        // Create a batch of table transaction actions for deleting entities
-        List<TableTransactionAction> deleteBatch = new(capacity: 100);
-
-        // Local function for deleting batches of assistant state
-        async Task DeleteBatch()
+        if (request.PreserveChatHistory)
         {
-            if (deleteBatch.Count > 0)
+            InternalChatState? existingState = await this.LoadChatStateAsync(request.Id, tableClient, cancellationToken);
+            if (existingState is not null && existingState.Metadata.Exists)
             {
-                this.logger.LogInformation(
-                    "Deleting {Count} record(s) for assistant '{Id}'.",
-                    deleteBatch.Count,
-                    request.Id);
-                await tableClient.SubmitTransactionAsync(deleteBatch);
-                deleteBatch.Clear();
+                await this.UpdateAssistantInstructionsAsync(request, existingState, tableClient, cancellationToken);
+                return;
             }
         }
-
-        await foreach (TableEntity entity in queryResultsFilter)
+        else
         {
-            // If the count is greater than or equal to 100, submit the transaction and clear the batch
-            if (deleteBatch.Count >= 100)
-            {
-                await DeleteBatch();
-            }
-
-            deleteBatch.Add(new TableTransactionAction(TableTransactionActionType.Delete, entity));
+            await this.DeleteAssistantStateAsync(request.Id, tableClient, cancellationToken);
         }
 
-        if (deleteBatch.Any())
-        {
-            // delete any remaining
-            await DeleteBatch();
-        }
-
-        // Create a batch of table transaction actions
-        List<TableTransactionAction> batch = new();
-
-        // Add first chat message entity to table
-        if (!string.IsNullOrWhiteSpace(request.Instructions))
-        {
-            ChatMessageTableEntity chatMessageEntity = new(
-                partitionKey: request.Id,
-                messageIndex: 1, // 1-based index
-                content: request.Instructions,
-                role: ChatMessageRole.System,
-                toolCalls: null);
-
-            batch.Add(new TableTransactionAction(TableTransactionActionType.Add, chatMessageEntity));
-        }
-
-        // Add assistant state entity to table
-        AssistantStateEntity assistantStateEntity = new(request.Id) { TotalMessages = batch.Count };
-
-        batch.Add(new TableTransactionAction(TableTransactionActionType.Add, assistantStateEntity));
-
-        // Add the batch of table transaction actions to the table
-        await tableClient.SubmitTransactionAsync(batch);
+        await this.CreateAssistantEntitiesAsync(request, tableClient, cancellationToken);
     }
 
     public async Task<AssistantState> GetStateAsync(AssistantQueryAttribute assistantQuery, CancellationToken cancellationToken)
@@ -209,6 +167,116 @@ class DefaultAssistantService : IAssistantService
     }
 
     // Helper methods
+    async Task DeleteAssistantStateAsync(string assistantId, TableClient tableClient, CancellationToken cancellationToken)
+    {
+        AsyncPageable<TableEntity> queryResultsFilter = tableClient.QueryAsync<TableEntity>(
+            filter: $"PartitionKey eq '{assistantId}'",
+            cancellationToken: cancellationToken);
+
+        List<TableTransactionAction> deleteBatch = new(capacity: 100);
+
+        async Task DeleteBatch()
+        {
+            if (deleteBatch.Count > 0)
+            {
+                this.logger.LogInformation(
+                    "Deleting {Count} record(s) for assistant '{Id}'.",
+                    deleteBatch.Count,
+                    assistantId);
+                await tableClient.SubmitTransactionAsync(deleteBatch, cancellationToken);
+                deleteBatch.Clear();
+            }
+        }
+
+        await foreach (TableEntity entity in queryResultsFilter)
+        {
+            if (deleteBatch.Count >= 100)
+            {
+                await DeleteBatch();
+            }
+
+            deleteBatch.Add(new TableTransactionAction(TableTransactionActionType.Delete, entity));
+        }
+
+        if (deleteBatch.Any())
+        {
+            await DeleteBatch();
+        }
+    }
+
+    async Task CreateAssistantEntitiesAsync(AssistantCreateRequest request, TableClient tableClient, CancellationToken cancellationToken)
+    {
+        List<TableTransactionAction> batch = new();
+
+        if (!string.IsNullOrWhiteSpace(request.Instructions))
+        {
+            ChatMessageTableEntity chatMessageEntity = new(
+                partitionKey: request.Id,
+                messageIndex: 1, // 1-based index
+                content: request.Instructions,
+                role: ChatMessageRole.System,
+                toolCalls: null);
+
+            batch.Add(new TableTransactionAction(TableTransactionActionType.Add, chatMessageEntity));
+        }
+
+        AssistantStateEntity assistantStateEntity = new(request.Id) { TotalMessages = batch.Count };
+
+        batch.Add(new TableTransactionAction(TableTransactionActionType.Add, assistantStateEntity));
+
+        await tableClient.SubmitTransactionAsync(batch, cancellationToken);
+    }
+
+    async Task UpdateAssistantInstructionsAsync(
+        AssistantCreateRequest request,
+        InternalChatState chatState,
+        TableClient tableClient,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(request.Instructions))
+        {
+            this.logger.LogInformation(
+                "[{Id}] PreserveChatHistory requested without new instructions. No changes applied.",
+                request.Id);
+            return;
+        }
+
+        ChatMessageTableEntity? systemMessage = chatState.Messages
+            .Where(msg => string.Equals(msg.Role, ChatMessageRole.System.ToString(), StringComparison.OrdinalIgnoreCase))
+            .OrderBy(msg => msg.RowKey, StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault();
+
+        List<TableTransactionAction> batch = new();
+
+        if (systemMessage is not null)
+        {
+            systemMessage.Content = request.Instructions;
+            systemMessage.CreatedAt = DateTime.UtcNow;
+            batch.Add(new TableTransactionAction(TableTransactionActionType.UpdateMerge, systemMessage));
+        }
+        else
+        {
+            this.logger.LogWarning(
+                "[{Id}] No existing system message found. Appending new system instructions.",
+                request.Id);
+
+            ChatMessageTableEntity newSystemMessage = new(
+                partitionKey: request.Id,
+                messageIndex: chatState.Metadata.TotalMessages + 1,
+                content: request.Instructions,
+                role: ChatMessageRole.System,
+                toolCalls: null);
+
+            chatState.Messages.Add(newSystemMessage);
+            chatState.Metadata.TotalMessages++;
+            batch.Add(new TableTransactionAction(TableTransactionActionType.Add, newSystemMessage));
+        }
+
+        chatState.Metadata.LastUpdatedAt = DateTime.UtcNow;
+        batch.Add(new TableTransactionAction(TableTransactionActionType.UpdateMerge, chatState.Metadata));
+
+        await tableClient.SubmitTransactionAsync(batch, cancellationToken);
+    }
     void ValidateAttributes(AssistantPostAttribute attribute)
     {
         if (string.IsNullOrEmpty(attribute.Id))
@@ -299,11 +367,198 @@ class DefaultAssistantService : IAssistantService
             }
         }
 
-        IEnumerable<ChatMessage> chatMessages = ToOpenAIChatRequestMessages(chatState.Messages);
+        IReadOnlyList<ChatMessageTableEntity> trimmedMessages = this.TrimMessagesForContextBudget(attribute.Id, chatState.Messages);
+        IEnumerable<ChatMessage> chatMessages = ToOpenAIChatRequestMessages(trimmedMessages);
 
         return await this.openAIClientFactory.GetChatClient(
             attribute.AIConnectionName,
             attribute.ChatModel).CompleteChatAsync(chatMessages, chatRequest, cancellationToken: cancellationToken);
+    }
+
+    List<ChatMessageTableEntity> TrimMessagesForContextBudget(
+        string assistantId,
+        IReadOnlyList<ChatMessageTableEntity> sourceMessages)
+    {
+        int effectiveContextBudget = MaxContextTokens - ReservedForResponseTokens - ReservedForFunctionTokens;
+        List<ChatMessageTableEntity> requestMessages = sourceMessages.Select(CloneChatMessageForRequest).ToList();
+
+        int beforeEstimate = EstimateRequestTokens(requestMessages);
+        if (beforeEstimate <= effectiveContextBudget)
+        {
+            return requestMessages;
+        }
+
+        int removedMessageCount = 0;
+        int latestUserIndex = FindLatestUserMessageIndex(requestMessages);
+
+        while (EstimateRequestTokens(requestMessages) > effectiveContextBudget)
+        {
+            int removableIndex = FindOldestRemovableMessageIndex(requestMessages, latestUserIndex);
+            if (removableIndex < 0)
+            {
+                break;
+            }
+
+            requestMessages.RemoveAt(removableIndex);
+            removedMessageCount++;
+
+            if (latestUserIndex >= 0 && removableIndex < latestUserIndex)
+            {
+                latestUserIndex--;
+            }
+        }
+
+        int afterEstimate = EstimateRequestTokens(requestMessages);
+
+        if (afterEstimate > effectiveContextBudget)
+        {
+            int oldestNonSystemIndex = FindOldestNonSystemMessageIndex(requestMessages);
+            if (oldestNonSystemIndex >= 0)
+            {
+                ChatMessageTableEntity messageToTrim = requestMessages[oldestNonSystemIndex];
+                int remainingTokenEstimate = afterEstimate - EstimateMessageTokens(messageToTrim);
+                int allowedTokensForMessage = Math.Max(1, effectiveContextBudget - remainingTokenEstimate);
+                messageToTrim.Content = TrimContentToEstimatedTokens(messageToTrim.Content, allowedTokensForMessage);
+                afterEstimate = EstimateRequestTokens(requestMessages);
+            }
+        }
+
+        if (afterEstimate < beforeEstimate)
+        {
+            this.logger.LogInformation(
+                "[{Id}] Trimmed chat request for context budget. beforeEstimate={BeforeEstimate}, afterEstimate={AfterEstimate}, removedMessageCount={RemovedMessageCount}",
+                assistantId,
+                beforeEstimate,
+                afterEstimate,
+                removedMessageCount);
+        }
+
+        return requestMessages;
+    }
+
+    static int FindLatestUserMessageIndex(IReadOnlyList<ChatMessageTableEntity> messages)
+    {
+        for (int index = messages.Count - 1; index >= 0; index--)
+        {
+            if (string.Equals(messages[index].Role, ChatMessageRole.User.ToString(), StringComparison.OrdinalIgnoreCase))
+            {
+                return index;
+            }
+        }
+
+        return -1;
+    }
+
+    static int FindOldestRemovableMessageIndex(IReadOnlyList<ChatMessageTableEntity> messages, int latestUserIndex)
+    {
+        for (int index = 0; index < messages.Count; index++)
+        {
+            if (index == latestUserIndex)
+            {
+                continue;
+            }
+
+            if (!string.Equals(messages[index].Role, ChatMessageRole.System.ToString(), StringComparison.OrdinalIgnoreCase))
+            {
+                return index;
+            }
+        }
+
+        return -1;
+    }
+
+    static int FindOldestNonSystemMessageIndex(IReadOnlyList<ChatMessageTableEntity> messages)
+    {
+        for (int index = 0; index < messages.Count; index++)
+        {
+            if (!string.Equals(messages[index].Role, ChatMessageRole.System.ToString(), StringComparison.OrdinalIgnoreCase))
+            {
+                return index;
+            }
+        }
+
+        return -1;
+    }
+
+    static ChatMessageTableEntity CloneChatMessageForRequest(ChatMessageTableEntity source)
+    {
+        ChatMessageTableEntity copy = new(
+            partitionKey: source.PartitionKey,
+            messageIndex: 0,
+            content: source.Content ?? string.Empty,
+            role: ParseChatMessageRole(source.Role),
+            name: source.Name,
+            toolCalls: source.ToolCalls);
+
+        copy.RowKey = source.RowKey;
+        copy.CreatedAt = source.CreatedAt;
+        copy.Timestamp = source.Timestamp;
+        copy.ETag = source.ETag;
+        return copy;
+    }
+
+    static ChatMessageRole ParseChatMessageRole(string role)
+    {
+        if (string.Equals(role, ChatMessageRole.User.ToString(), StringComparison.OrdinalIgnoreCase))
+        {
+            return ChatMessageRole.User;
+        }
+
+        if (string.Equals(role, ChatMessageRole.Assistant.ToString(), StringComparison.OrdinalIgnoreCase))
+        {
+            return ChatMessageRole.Assistant;
+        }
+
+        if (string.Equals(role, ChatMessageRole.System.ToString(), StringComparison.OrdinalIgnoreCase))
+        {
+            return ChatMessageRole.System;
+        }
+
+        if (string.Equals(role, ChatMessageRole.Tool.ToString(), StringComparison.OrdinalIgnoreCase))
+        {
+            return ChatMessageRole.Tool;
+        }
+
+        throw new InvalidOperationException($"Unknown chat role '{role}'");
+    }
+
+    static int EstimateRequestTokens(IReadOnlyList<ChatMessageTableEntity> messages)
+    {
+        int total = 3;
+
+        foreach (ChatMessageTableEntity message in messages)
+        {
+            total += EstimateMessageTokens(message);
+        }
+
+        return total;
+    }
+
+    static int EstimateMessageTokens(ChatMessageTableEntity message)
+    {
+        // Deterministic approximation used as a guardrail when exact tokenization is not available.
+        int contentLength = message.Content?.Length ?? 0;
+        int nameLength = message.Name?.Length ?? 0;
+        int toolCallsLength = message.ToolCallsString?.Length ?? 0;
+        int estimatedContentTokens = (contentLength + nameLength + toolCallsLength + (ApproximateCharsPerToken - 1)) / ApproximateCharsPerToken;
+
+        return MessageTokenOverhead + estimatedContentTokens;
+    }
+
+    static string TrimContentToEstimatedTokens(string? content, int allowedTokens)
+    {
+        if (string.IsNullOrEmpty(content))
+        {
+            return string.Empty;
+        }
+
+        int maxCharacters = Math.Max(0, allowedTokens * ApproximateCharsPerToken);
+        if (content.Length <= maxCharacters)
+        {
+            return content;
+        }
+
+        return content[..maxCharacters];
     }
 
     string FormatReplyMessage(ClientResult<ChatCompletion> response)

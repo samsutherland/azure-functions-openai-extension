@@ -183,6 +183,252 @@ public class DefaultAssistantServiceTests
     }
 
     [Fact]
+    public async Task CreateAssistantAsync_WithPreserveChatHistory_UpdatesSystemMessageInPlace()
+    {
+        // Arrange
+        var request = new AssistantCreateRequest("testId", "Updated instructions")
+        {
+            CollectionName = "ChatState",
+            ChatStorageConnectionSetting = "AzureWebJobsStorage",
+            PreserveChatHistory = true
+        };
+
+        var stateEntity = new TableEntity(request.Id, AssistantStateEntity.FixedRowKeyValue)
+        {
+            [nameof(AssistantStateEntity.Exists)] = true,
+            [nameof(AssistantStateEntity.CreatedAt)] = DateTime.UtcNow.AddDays(-1),
+            [nameof(AssistantStateEntity.LastUpdatedAt)] = DateTime.UtcNow.AddHours(-1),
+            [nameof(AssistantStateEntity.TotalMessages)] = 2,
+            [nameof(AssistantStateEntity.TotalTokens)] = 0
+        };
+
+        var systemMessage = new TableEntity(request.Id, "msg-0001")
+        {
+            [nameof(ChatMessageTableEntity.Content)] = "Original instructions",
+            [nameof(ChatMessageTableEntity.Role)] = ChatMessageRole.System.ToString(),
+            [nameof(ChatMessageTableEntity.CreatedAt)] = DateTime.UtcNow.AddHours(-2),
+            [nameof(ChatMessageTableEntity.ToolCalls)] = ""
+        };
+
+        var userMessage = new TableEntity(request.Id, "msg-0002")
+        {
+            [nameof(ChatMessageTableEntity.Content)] = "Hello",
+            [nameof(ChatMessageTableEntity.Role)] = ChatMessageRole.User.ToString(),
+            [nameof(ChatMessageTableEntity.CreatedAt)] = DateTime.UtcNow.AddHours(-1),
+            [nameof(ChatMessageTableEntity.ToolCalls)] = ""
+        };
+
+        AsyncPageable<TableEntity> mockQueryable = MockAsyncPageable<TableEntity>.Create(
+            new List<TableEntity> { stateEntity, systemMessage, userMessage });
+
+        this.mockTableClient.Setup(x => x.CreateIfNotExistsAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Response.FromValue(new TableItem(request.CollectionName), new Mock<Response>().Object));
+
+        this.mockTableClient.Setup(x => x.QueryAsync<TableEntity>(
+                It.Is<string>(s => s == $"PartitionKey eq '{request.Id}'"),
+                null,
+                null,
+                It.IsAny<CancellationToken>()))
+            .Returns(mockQueryable);
+
+        this.mockTableClient.Setup(x => x.SubmitTransactionAsync(
+                It.IsAny<IEnumerable<TableTransactionAction>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Response.FromValue(new List<Response>() as IReadOnlyList<Response>, new Mock<Response>().Object));
+
+        var assistantService = new DefaultAssistantService(
+            this.mockOpenAIClientFactory.Object,
+            this.mockAzureComponentFactory.Object,
+            this.mockConfiguration.Object,
+            this.mockSkillInvoker.Object,
+            this.mockLoggerFactory.Object);
+
+        System.Reflection.FieldInfo? tableClientField = typeof(DefaultAssistantService).GetField(
+            "tableClient",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        tableClientField?.SetValue(assistantService, this.mockTableClient.Object);
+
+        // Act
+        await assistantService.CreateAssistantAsync(request, CancellationToken.None);
+
+        // Assert
+        this.mockTableClient.Verify(x => x.SubmitTransactionAsync(
+            It.Is<IEnumerable<TableTransactionAction>>(actions =>
+                actions.Any(a => a.ActionType == TableTransactionActionType.UpdateMerge) &&
+                actions.All(a => a.ActionType != TableTransactionActionType.Delete) &&
+                actions.All(a => a.ActionType != TableTransactionActionType.Add)),
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task CreateAssistantAsync_WithPreserveChatHistory_NoSystemMessage_AppendsSystemMessage()
+    {
+        // Arrange
+        var request = new AssistantCreateRequest("testId", "Updated instructions")
+        {
+            CollectionName = "ChatState",
+            ChatStorageConnectionSetting = "AzureWebJobsStorage",
+            PreserveChatHistory = true
+        };
+
+        var stateEntity = new TableEntity(request.Id, AssistantStateEntity.FixedRowKeyValue)
+        {
+            [nameof(AssistantStateEntity.Exists)] = true,
+            [nameof(AssistantStateEntity.CreatedAt)] = DateTime.UtcNow.AddDays(-1),
+            [nameof(AssistantStateEntity.LastUpdatedAt)] = DateTime.UtcNow.AddHours(-1),
+            [nameof(AssistantStateEntity.TotalMessages)] = 1,
+            [nameof(AssistantStateEntity.TotalTokens)] = 0
+        };
+
+        var userMessage = new TableEntity(request.Id, "msg-0001")
+        {
+            [nameof(ChatMessageTableEntity.Content)] = "Hello",
+            [nameof(ChatMessageTableEntity.Role)] = ChatMessageRole.User.ToString(),
+            [nameof(ChatMessageTableEntity.CreatedAt)] = DateTime.UtcNow.AddHours(-1),
+            [nameof(ChatMessageTableEntity.ToolCalls)] = ""
+        };
+
+        AsyncPageable<TableEntity> mockQueryable = MockAsyncPageable<TableEntity>.Create(
+            new List<TableEntity> { stateEntity, userMessage });
+
+        this.mockTableClient.Setup(x => x.CreateIfNotExistsAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Response.FromValue(new TableItem(request.CollectionName), new Mock<Response>().Object));
+
+        this.mockTableClient.Setup(x => x.QueryAsync<TableEntity>(
+                It.Is<string>(s => s == $"PartitionKey eq '{request.Id}'"),
+                null,
+                null,
+                It.IsAny<CancellationToken>()))
+            .Returns(mockQueryable);
+
+        this.mockTableClient.Setup(x => x.SubmitTransactionAsync(
+                It.IsAny<IEnumerable<TableTransactionAction>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Response.FromValue(new List<Response>() as IReadOnlyList<Response>, new Mock<Response>().Object));
+
+        var assistantService = new DefaultAssistantService(
+            this.mockOpenAIClientFactory.Object,
+            this.mockAzureComponentFactory.Object,
+            this.mockConfiguration.Object,
+            this.mockSkillInvoker.Object,
+            this.mockLoggerFactory.Object);
+
+        System.Reflection.FieldInfo? tableClientField = typeof(DefaultAssistantService).GetField(
+            "tableClient",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        tableClientField?.SetValue(assistantService, this.mockTableClient.Object);
+
+        // Act
+        await assistantService.CreateAssistantAsync(request, CancellationToken.None);
+
+        // Assert
+        this.mockTableClient.Verify(x => x.SubmitTransactionAsync(
+            It.Is<IEnumerable<TableTransactionAction>>(actions =>
+                actions.Any(a => a.ActionType == TableTransactionActionType.Add) &&
+                actions.Any(a => a.ActionType == TableTransactionActionType.UpdateMerge) &&
+                actions.All(a => a.ActionType != TableTransactionActionType.Delete)),
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task CreateAssistantAsync_PreserveHistory_UpdatesSystemMessage_AndKeepsUserMessage()
+    {
+        // Arrange
+        var tableEntities = new List<TableEntity>();
+
+        void ApplyActions(IEnumerable<TableTransactionAction> actions)
+        {
+            foreach (TableTransactionAction action in actions)
+            {
+                TableEntity entity = this.ConvertToTableEntity(action.Entity);
+
+                switch (action.ActionType)
+                {
+                    case TableTransactionActionType.Add:
+                        tableEntities.Add(entity);
+                        break;
+                    case TableTransactionActionType.UpdateMerge:
+                        TableEntity? existing = tableEntities.FirstOrDefault(
+                            e => e.PartitionKey == entity.PartitionKey && e.RowKey == entity.RowKey);
+                        if (existing != null)
+                        {
+                            foreach (KeyValuePair<string, object> property in entity)
+                            {
+                                existing[property.Key] = property.Value;
+                            }
+                        }
+                        break;
+                    case TableTransactionActionType.Delete:
+                        tableEntities.RemoveAll(e => e.PartitionKey == entity.PartitionKey && e.RowKey == entity.RowKey);
+                        break;
+                }
+            }
+        }
+
+        var assistantService = new DefaultAssistantService(
+            this.mockOpenAIClientFactory.Object,
+            this.mockAzureComponentFactory.Object,
+            this.mockConfiguration.Object,
+            this.mockSkillInvoker.Object,
+            this.mockLoggerFactory.Object);
+
+        System.Reflection.FieldInfo? tableClientField = typeof(DefaultAssistantService).GetField(
+            "tableClient",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        tableClientField?.SetValue(assistantService, this.mockTableClient.Object);
+
+        this.mockTableClient.Setup(x => x.CreateIfNotExistsAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Response.FromValue(new TableItem("ChatState"), new Mock<Response>().Object));
+
+        this.mockTableClient.Setup(x => x.QueryAsync<TableEntity>(
+                It.IsAny<string>(),
+                null,
+                null,
+                It.IsAny<CancellationToken>()))
+            .Returns(() => MockAsyncPageable<TableEntity>.Create(tableEntities.ToList()));
+
+        this.mockTableClient.Setup(x => x.SubmitTransactionAsync(
+                It.IsAny<IEnumerable<TableTransactionAction>>(),
+                It.IsAny<CancellationToken>()))
+            .Callback<IEnumerable<TableTransactionAction>, CancellationToken>((actions, _) => ApplyActions(actions))
+            .ReturnsAsync(Response.FromValue(new List<Response>() as IReadOnlyList<Response>, new Mock<Response>().Object));
+
+        // 1) Create a new assistant with a system message
+        var initialCreate = new AssistantCreateRequest("testId", "Initial instructions")
+        {
+            CollectionName = "ChatState",
+            ChatStorageConnectionSetting = "AzureWebJobsStorage"
+        };
+
+        await assistantService.CreateAssistantAsync(initialCreate, CancellationToken.None);
+
+        // 2) Add a user message
+        tableEntities.Add(new TableEntity("testId", "msg-0002")
+        {
+            [nameof(ChatMessageTableEntity.Content)] = "Hello",
+            [nameof(ChatMessageTableEntity.Role)] = ChatMessageRole.User.ToString(),
+            [nameof(ChatMessageTableEntity.CreatedAt)] = DateTime.UtcNow,
+            [nameof(ChatMessageTableEntity.ToolCalls)] = ""
+        });
+
+        // 3) Update the system message
+        var updateCreate = new AssistantCreateRequest("testId", "Updated instructions")
+        {
+            CollectionName = "ChatState",
+            ChatStorageConnectionSetting = "AzureWebJobsStorage",
+            PreserveChatHistory = true
+        };
+
+        await assistantService.CreateAssistantAsync(updateCreate, CancellationToken.None);
+
+        // 4) Confirm the user message still exists
+        Assert.Contains(tableEntities, entity =>
+            entity.PartitionKey == "testId" &&
+            entity.RowKey == "msg-0002" &&
+            entity.GetString(nameof(ChatMessageTableEntity.Role)) == ChatMessageRole.User.ToString());
+    }
+
+    [Fact]
     public async Task GetStateAsync_WithValidId_ReturnsCorrectState()
     {
         // Arrange
@@ -423,6 +669,94 @@ public class DefaultAssistantServiceTests
             assistantService.PostMessageAsync(attributeNoId, CancellationToken.None));
     }
 
+    [Fact]
+    public void TrimMessagesForContextBudget_WithLongHistory_TrimsToEffectiveBudget()
+    {
+        // Arrange
+        const int effectiveBudget = 128000 - 1024 - 4000;
+        const string assistantId = "testId";
+
+        var assistantService = new DefaultAssistantService(
+            this.mockOpenAIClientFactory.Object,
+            this.mockAzureComponentFactory.Object,
+            this.mockConfiguration.Object,
+            this.mockSkillInvoker.Object,
+            this.mockLoggerFactory.Object);
+
+        List<ChatMessageTableEntity> messages = new()
+        {
+            new ChatMessageTableEntity(assistantId, 1, "System instructions", ChatMessageRole.System)
+        };
+
+        for (int i = 0; i < 45; i++)
+        {
+            ChatMessageRole role = i % 2 == 0 ? ChatMessageRole.User : ChatMessageRole.Assistant;
+            messages.Add(new ChatMessageTableEntity(assistantId, i + 2, new string('x', 12000), role));
+        }
+
+        messages.Add(new ChatMessageTableEntity(assistantId, messages.Count + 1, "latest-user-message", ChatMessageRole.User));
+
+        System.Reflection.MethodInfo? trimMethod = typeof(DefaultAssistantService).GetMethod(
+            "TrimMessagesForContextBudget",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        System.Reflection.MethodInfo? estimateMethod = typeof(DefaultAssistantService).GetMethod(
+            "EstimateRequestTokens",
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+
+        Assert.NotNull(trimMethod);
+        Assert.NotNull(estimateMethod);
+
+        // Act
+        var trimmedMessages = (List<ChatMessageTableEntity>)trimMethod!.Invoke(assistantService, [assistantId, messages])!;
+        int estimatedTokens = (int)estimateMethod!.Invoke(null, [trimmedMessages])!;
+
+        // Assert
+        Assert.True(estimatedTokens <= effectiveBudget);
+        Assert.True(trimmedMessages.Count < messages.Count);
+    }
+
+    [Fact]
+    public void TrimMessagesForContextBudget_WithLongHistory_RetainsNewestUserMessage()
+    {
+        // Arrange
+        const string assistantId = "testId";
+        const string latestUserMessage = "do not remove me";
+
+        var assistantService = new DefaultAssistantService(
+            this.mockOpenAIClientFactory.Object,
+            this.mockAzureComponentFactory.Object,
+            this.mockConfiguration.Object,
+            this.mockSkillInvoker.Object,
+            this.mockLoggerFactory.Object);
+
+        List<ChatMessageTableEntity> messages = new()
+        {
+            new ChatMessageTableEntity(assistantId, 1, "System instructions", ChatMessageRole.System)
+        };
+
+        for (int i = 0; i < 40; i++)
+        {
+            ChatMessageRole role = i % 2 == 0 ? ChatMessageRole.User : ChatMessageRole.Assistant;
+            messages.Add(new ChatMessageTableEntity(assistantId, i + 2, new string('y', 10000), role));
+        }
+
+        messages.Add(new ChatMessageTableEntity(assistantId, messages.Count + 1, latestUserMessage, ChatMessageRole.User));
+
+        System.Reflection.MethodInfo? trimMethod = typeof(DefaultAssistantService).GetMethod(
+            "TrimMessagesForContextBudget",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+
+        Assert.NotNull(trimMethod);
+
+        // Act
+        var trimmedMessages = (List<ChatMessageTableEntity>)trimMethod!.Invoke(assistantService, [assistantId, messages])!;
+        ChatMessageTableEntity newestUser = trimmedMessages.Last(m =>
+            string.Equals(m.Role, ChatMessageRole.User.ToString(), StringComparison.OrdinalIgnoreCase));
+
+        // Assert
+        Assert.Equal(latestUserMessage, newestUser.Content);
+    }
+
     static Mock<IConfigurationSection> CreateMockSection(bool exists, string? tableServiceUri = null)
     {
         var mockSection = new Mock<IConfigurationSection>();
@@ -444,6 +778,44 @@ public class DefaultAssistantServiceTests
         mockSection.Setup(s => s.GetSection("tableServiceUri")).Returns(endpointSection.Object);
 
         return mockSection;
+    }
+
+    TableEntity ConvertToTableEntity(ITableEntity entity)
+    {
+        if (entity is TableEntity tableEntity)
+        {
+            return tableEntity;
+        }
+
+        TableEntity result = new(entity.PartitionKey, entity.RowKey)
+        {
+            ETag = entity.ETag,
+            Timestamp = entity.Timestamp
+        };
+
+        foreach (System.Reflection.PropertyInfo property in entity.GetType().GetProperties())
+        {
+            if (!property.CanRead)
+            {
+                continue;
+            }
+
+            if (property.Name is nameof(ITableEntity.PartitionKey)
+                or nameof(ITableEntity.RowKey)
+                or nameof(ITableEntity.ETag)
+                or nameof(ITableEntity.Timestamp))
+            {
+                continue;
+            }
+
+            object? value = property.GetValue(entity);
+            if (value is not null)
+            {
+                result[property.Name] = value;
+            }
+        }
+
+        return result;
     }
 }
 
