@@ -6,7 +6,7 @@
     "CosmosDbConnectionString": "Local Cosmos DB emulator or Cosmos DB in Azure connection string",
     "CosmosDatabaseName": "todoDB",
     "CosmosContainerName": "myTasks",
-    "AZURE_OPENAI_ENDPOINT": "https://extension-reset-resource.cognitiveservices.azure.com/",
-    "CHAT_MODEL_DEPLOYMENT_NAME": "gpt-5-chat"
+    "AZURE_OPENAI_ENDPOINT": "https://maxtokenstest-resource.cognitiveservices.azure.com/",
+    "CHAT_MODEL_DEPLOYMENT_NAME": "gpt-5.4"
   }
 }

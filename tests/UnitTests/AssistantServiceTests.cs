@@ -675,6 +675,7 @@ public class DefaultAssistantServiceTests
         // Arrange
         const int effectiveBudget = 128000 - 1024 - 4000;
         const string assistantId = "testId";
+        const string chatModel = "gpt-4";
 
         var assistantService = new DefaultAssistantService(
             this.mockOpenAIClientFactory.Object,
@@ -707,7 +708,7 @@ public class DefaultAssistantServiceTests
         Assert.NotNull(estimateMethod);
 
         // Act
-        var trimmedMessages = (List<ChatMessageTableEntity>)trimMethod!.Invoke(assistantService, [assistantId, messages])!;
+        var trimmedMessages = (List<ChatMessageTableEntity>)trimMethod!.Invoke(assistantService, [assistantId, chatModel, messages])!;
         int estimatedTokens = (int)estimateMethod!.Invoke(null, [trimmedMessages])!;
 
         // Assert
@@ -720,6 +721,7 @@ public class DefaultAssistantServiceTests
     {
         // Arrange
         const string assistantId = "testId";
+        const string chatModel = "gpt-4";
         const string latestUserMessage = "do not remove me";
 
         var assistantService = new DefaultAssistantService(
@@ -749,12 +751,50 @@ public class DefaultAssistantServiceTests
         Assert.NotNull(trimMethod);
 
         // Act
-        var trimmedMessages = (List<ChatMessageTableEntity>)trimMethod!.Invoke(assistantService, [assistantId, messages])!;
+        var trimmedMessages = (List<ChatMessageTableEntity>)trimMethod!.Invoke(assistantService, [assistantId, chatModel, messages])!;
         ChatMessageTableEntity newestUser = trimmedMessages.Last(m =>
             string.Equals(m.Role, ChatMessageRole.User.ToString(), StringComparison.OrdinalIgnoreCase));
 
         // Assert
         Assert.Equal(latestUserMessage, newestUser.Content);
+    }
+
+    [Fact]
+    public void TrimMessagesForContextBudget_WithGpt54Model_UsesExpandedContextBudget()
+    {
+        // Arrange
+        const string assistantId = "testId";
+        const string chatModel = "gpt-5.4";
+
+        var assistantService = new DefaultAssistantService(
+            this.mockOpenAIClientFactory.Object,
+            this.mockAzureComponentFactory.Object,
+            this.mockConfiguration.Object,
+            this.mockSkillInvoker.Object,
+            this.mockLoggerFactory.Object);
+
+        List<ChatMessageTableEntity> messages = new()
+        {
+            new ChatMessageTableEntity(assistantId, 1, "System instructions", ChatMessageRole.System)
+        };
+
+        for (int i = 0; i < 45; i++)
+        {
+            ChatMessageRole role = i % 2 == 0 ? ChatMessageRole.User : ChatMessageRole.Assistant;
+            messages.Add(new ChatMessageTableEntity(assistantId, i + 2, new string('z', 12000), role));
+        }
+
+        System.Reflection.MethodInfo? trimMethod = typeof(DefaultAssistantService).GetMethod(
+            "TrimMessagesForContextBudget",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+
+        Assert.NotNull(trimMethod);
+
+        // Act
+        var trimmedMessages = (List<ChatMessageTableEntity>)trimMethod!.Invoke(assistantService, [assistantId, chatModel, messages])!;
+
+        // Assert
+        Assert.Equal(messages.Count, trimmedMessages.Count);
     }
 
     static Mock<IConfigurationSection> CreateMockSection(bool exists, string? tableServiceUri = null)

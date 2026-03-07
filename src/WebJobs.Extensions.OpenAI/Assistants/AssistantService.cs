@@ -28,7 +28,8 @@ class DefaultAssistantService : IAssistantService
     /// This number must be small enough to ensure we never exceed a batch size of 100.
     /// </summary>
     const int FunctionCallBatchLimit = 50;
-    const int MaxContextTokens = 128000;
+    const int DefaultMaxContextTokens = 128000;
+    const int Gpt54MaxContextTokens = 900000;
     const int ReservedForResponseTokens = 1024;
     const int ReservedForFunctionTokens = 4000;
     const int ApproximateCharsPerToken = 4;
@@ -367,7 +368,7 @@ class DefaultAssistantService : IAssistantService
             }
         }
 
-        IReadOnlyList<ChatMessageTableEntity> trimmedMessages = this.TrimMessagesForContextBudget(attribute.Id, chatState.Messages);
+        IReadOnlyList<ChatMessageTableEntity> trimmedMessages = this.TrimMessagesForContextBudget(attribute.Id, attribute.ChatModel, chatState.Messages);
         IEnumerable<ChatMessage> chatMessages = ToOpenAIChatRequestMessages(trimmedMessages);
 
         return await this.openAIClientFactory.GetChatClient(
@@ -377,9 +378,10 @@ class DefaultAssistantService : IAssistantService
 
     List<ChatMessageTableEntity> TrimMessagesForContextBudget(
         string assistantId,
+        string? chatModel,
         IReadOnlyList<ChatMessageTableEntity> sourceMessages)
     {
-        int effectiveContextBudget = MaxContextTokens - ReservedForResponseTokens - ReservedForFunctionTokens;
+        int effectiveContextBudget = GetMaxContextTokens(chatModel) - ReservedForResponseTokens - ReservedForFunctionTokens;
         List<ChatMessageTableEntity> requestMessages = sourceMessages.Select(CloneChatMessageForRequest).ToList();
 
         int beforeEstimate = EstimateRequestTokens(requestMessages);
@@ -434,6 +436,17 @@ class DefaultAssistantService : IAssistantService
         }
 
         return requestMessages;
+    }
+
+    static int GetMaxContextTokens(string? chatModel)
+    {
+        return IsGpt54Model(chatModel) ? Gpt54MaxContextTokens : DefaultMaxContextTokens;
+    }
+
+    static bool IsGpt54Model(string? chatModel)
+    {
+        return !string.IsNullOrWhiteSpace(chatModel)
+            && string.Equals(chatModel, "gpt-5.4", StringComparison.OrdinalIgnoreCase);
     }
 
     static int FindLatestUserMessageIndex(IReadOnlyList<ChatMessageTableEntity> messages)

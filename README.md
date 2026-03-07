@@ -3,6 +3,7 @@ Custom fork used by Streeka.
 Additional changes:
 - Allow updating assistant instructions without resetting chat history
 - Fix context length handling
+- Allow a million tokens if gpt5.4
 
 NuGet published to:
 https://nuget.pkg.github.com/samsutherland
