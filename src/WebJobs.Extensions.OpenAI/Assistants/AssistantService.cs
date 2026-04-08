@@ -34,6 +34,8 @@ class DefaultAssistantService : IAssistantService
     const int ReservedForFunctionTokens = 4000;
     const int ApproximateCharsPerToken = 4;
     const int MessageTokenOverhead = 12;
+    // Azure Table Storage allows max 64KB per property; UTF-16 strings are limited to 32K chars.
+    const int MaxTableStorageStringLength = 32000;
     const string DefaultChatStorage = "AzureWebJobsStorage";
     readonly OpenAIClientFactory openAIClientFactory;
     readonly IAssistantSkillInvoker skillInvoker;
@@ -214,7 +216,7 @@ class DefaultAssistantService : IAssistantService
             ChatMessageTableEntity chatMessageEntity = new(
                 partitionKey: request.Id,
                 messageIndex: 1, // 1-based index
-                content: request.Instructions,
+                content: TruncateForTableStorage(request.Instructions),
                 role: ChatMessageRole.System,
                 toolCalls: null);
 
@@ -251,7 +253,7 @@ class DefaultAssistantService : IAssistantService
 
         if (systemMessage is not null)
         {
-            systemMessage.Content = request.Instructions;
+            systemMessage.Content = TruncateForTableStorage(request.Instructions);
             systemMessage.CreatedAt = DateTime.UtcNow;
             batch.Add(new TableTransactionAction(TableTransactionActionType.UpdateMerge, systemMessage));
         }
@@ -264,7 +266,7 @@ class DefaultAssistantService : IAssistantService
             ChatMessageTableEntity newSystemMessage = new(
                 partitionKey: request.Id,
                 messageIndex: chatState.Metadata.TotalMessages + 1,
-                content: request.Instructions,
+                content: TruncateForTableStorage(request.Instructions),
                 role: ChatMessageRole.System,
                 toolCalls: null);
 
@@ -302,7 +304,7 @@ class DefaultAssistantService : IAssistantService
         ChatMessageTableEntity chatMessageEntity = new(
             partitionKey: attribute.Id,
             messageIndex: ++chatState.Metadata.TotalMessages,
-            content: attribute.UserMessage,
+            content: TruncateForTableStorage(attribute.UserMessage),
             role: ChatMessageRole.User,
             toolCalls: null);
         chatState.Messages.Add(chatMessageEntity);
@@ -395,18 +397,22 @@ class DefaultAssistantService : IAssistantService
 
         while (EstimateRequestTokens(requestMessages) > effectiveContextBudget)
         {
-            int removableIndex = FindOldestRemovableMessageIndex(requestMessages, latestUserIndex);
-            if (removableIndex < 0)
+            List<int> removableGroup = FindOldestRemovableGroup(requestMessages, latestUserIndex);
+            if (removableGroup.Count == 0)
             {
                 break;
             }
 
-            requestMessages.RemoveAt(removableIndex);
-            removedMessageCount++;
-
-            if (latestUserIndex >= 0 && removableIndex < latestUserIndex)
+            // Remove in descending order to preserve earlier indices during removal
+            foreach (int removeIndex in removableGroup.OrderByDescending(i => i))
             {
-                latestUserIndex--;
+                requestMessages.RemoveAt(removeIndex);
+                removedMessageCount++;
+
+                if (latestUserIndex >= 0 && removeIndex < latestUserIndex)
+                {
+                    latestUserIndex--;
+                }
             }
         }
 
@@ -462,7 +468,7 @@ class DefaultAssistantService : IAssistantService
         return -1;
     }
 
-    static int FindOldestRemovableMessageIndex(IReadOnlyList<ChatMessageTableEntity> messages, int latestUserIndex)
+    static List<int> FindOldestRemovableGroup(IReadOnlyList<ChatMessageTableEntity> messages, int latestUserIndex)
     {
         for (int index = 0; index < messages.Count; index++)
         {
@@ -471,13 +477,63 @@ class DefaultAssistantService : IAssistantService
                 continue;
             }
 
-            if (!string.Equals(messages[index].Role, ChatMessageRole.System.ToString(), StringComparison.OrdinalIgnoreCase))
+            ChatMessageTableEntity message = messages[index];
+
+            if (string.Equals(message.Role, ChatMessageRole.System.ToString(), StringComparison.OrdinalIgnoreCase))
             {
-                return index;
+                continue;
             }
+
+            List<int> group = new() { index };
+
+            // If this is an assistant message with tool calls, also remove the associated tool result messages
+            // so we never leave orphaned tool messages without a preceding tool_calls message.
+            if (string.Equals(message.Role, ChatMessageRole.Assistant.ToString(), StringComparison.OrdinalIgnoreCase)
+                && message.ToolCalls != null && message.ToolCalls.Any())
+            {
+                HashSet<string> callIds = message.ToolCalls.Select(tc => tc.Id).ToHashSet(StringComparer.Ordinal);
+                for (int j = index + 1; j < messages.Count; j++)
+                {
+                    ChatMessageTableEntity candidate = messages[j];
+                    if (string.Equals(candidate.Role, ChatMessageRole.Tool.ToString(), StringComparison.OrdinalIgnoreCase)
+                        && candidate.Name != null && callIds.Contains(candidate.Name))
+                    {
+                        group.Add(j);
+                    }
+                }
+            }
+            // If somehow the oldest removable message is a tool message, also remove the entire group
+            // it belongs to (the preceding assistant tool_calls message and any sibling tool messages).
+            else if (string.Equals(message.Role, ChatMessageRole.Tool.ToString(), StringComparison.OrdinalIgnoreCase))
+            {
+                for (int j = index - 1; j >= 0; j--)
+                {
+                    ChatMessageTableEntity candidate = messages[j];
+                    if (string.Equals(candidate.Role, ChatMessageRole.Assistant.ToString(), StringComparison.OrdinalIgnoreCase)
+                        && candidate.ToolCalls != null
+                        && candidate.ToolCalls.Any(tc => tc.Id == message.Name))
+                    {
+                        HashSet<string> callIds = candidate.ToolCalls.Select(tc => tc.Id).ToHashSet(StringComparer.Ordinal);
+                        group.Add(j);
+                        for (int k = j + 1; k < messages.Count; k++)
+                        {
+                            ChatMessageTableEntity sibling = messages[k];
+                            if (k != index
+                                && string.Equals(sibling.Role, ChatMessageRole.Tool.ToString(), StringComparison.OrdinalIgnoreCase)
+                                && sibling.Name != null && callIds.Contains(sibling.Name))
+                            {
+                                group.Add(k);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+
+            return group;
         }
 
-        return -1;
+        return new List<int>();
     }
 
     static int FindOldestNonSystemMessageIndex(IReadOnlyList<ChatMessageTableEntity> messages)
@@ -558,6 +614,16 @@ class DefaultAssistantService : IAssistantService
         return MessageTokenOverhead + estimatedContentTokens;
     }
 
+    static string TruncateForTableStorage(string? content)
+    {
+        if (string.IsNullOrEmpty(content) || content.Length <= MaxTableStorageStringLength)
+        {
+            return content ?? string.Empty;
+        }
+
+        return content[..MaxTableStorageStringLength];
+    }
+
     static string TrimContentToEstimatedTokens(string? content, int allowedTokens)
     {
         if (string.IsNullOrEmpty(content))
@@ -598,7 +664,7 @@ class DefaultAssistantService : IAssistantService
         ChatMessageTableEntity replyFromAssistantEntity = new(
             partitionKey: assistantId,
             messageIndex: ++chatState.Metadata.TotalMessages,
-            content: replyMessage,
+            content: TruncateForTableStorage(replyMessage),
             role: ChatMessageRole.Assistant,
             toolCalls: response.Value.ToolCalls);
 
@@ -661,7 +727,7 @@ class DefaultAssistantService : IAssistantService
         ChatMessageTableEntity functionResultEntity = new(
             partitionKey: assistantId,
             messageIndex: ++chatState.Metadata.TotalMessages,
-            content: $"Function Name: '{call.FunctionName}' and Function Result: '{functionResult}'",
+            content: TruncateForTableStorage($"Function Name: '{call.FunctionName}' and Function Result: '{functionResult}'"),
             role: ChatMessageRole.Tool,
             name: call.Id,
             toolCalls: null);
