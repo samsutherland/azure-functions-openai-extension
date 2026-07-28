@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 
 using System.ClientModel;
+using System.IO.Compression;
+using System.Text;
 using Azure;
 using Azure.Data.Tables;
 using Microsoft.Azure.WebJobs.Extensions.OpenAI.Models;
@@ -29,13 +31,14 @@ class DefaultAssistantService : IAssistantService
     /// </summary>
     const int FunctionCallBatchLimit = 50;
     const int DefaultMaxContextTokens = 128000;
-    const int Gpt54MaxContextTokens = 900000;
+    const string MaxContextTokensConfigurationKey = "ASSISTANT_MAX_CONTEXT_TOKENS";
     const int ReservedForResponseTokens = 1024;
     const int ReservedForFunctionTokens = 4000;
     const int ApproximateCharsPerToken = 4;
     const int MessageTokenOverhead = 12;
     // Azure Table Storage allows max 64KB per property; UTF-16 strings are limited to 32K chars.
     const int MaxTableStorageStringLength = 32000;
+    const string CompressedContentPrefix = "__gzip_base64_v1__:";
     const string DefaultChatStorage = "AzureWebJobsStorage";
     readonly OpenAIClientFactory openAIClientFactory;
     readonly IAssistantSkillInvoker skillInvoker;
@@ -133,7 +136,7 @@ class DefaultAssistantService : IAssistantService
             chatState.Metadata.LastUpdatedAt,
             chatState.Metadata.TotalMessages,
             chatState.Metadata.TotalTokens,
-            filteredChatMessages.Select(msg => new AssistantMessage(msg.Content, msg.Role, msg.ToolCallsString)).ToList());
+            filteredChatMessages.Select(msg => new AssistantMessage(DecodeContentFromTableStorage(msg.Content), msg.Role, msg.ToolCallsString)).ToList());
         return state;
     }
 
@@ -216,7 +219,7 @@ class DefaultAssistantService : IAssistantService
             ChatMessageTableEntity chatMessageEntity = new(
                 partitionKey: request.Id,
                 messageIndex: 1, // 1-based index
-                content: TruncateForTableStorage(request.Instructions),
+                content: EncodeContentForTableStorage(request.Instructions),
                 role: ChatMessageRole.System,
                 toolCalls: null);
 
@@ -253,7 +256,7 @@ class DefaultAssistantService : IAssistantService
 
         if (systemMessage is not null)
         {
-            systemMessage.Content = TruncateForTableStorage(request.Instructions);
+            systemMessage.Content = EncodeContentForTableStorage(request.Instructions);
             systemMessage.CreatedAt = DateTime.UtcNow;
             batch.Add(new TableTransactionAction(TableTransactionActionType.UpdateMerge, systemMessage));
         }
@@ -266,7 +269,7 @@ class DefaultAssistantService : IAssistantService
             ChatMessageTableEntity newSystemMessage = new(
                 partitionKey: request.Id,
                 messageIndex: chatState.Metadata.TotalMessages + 1,
-                content: TruncateForTableStorage(request.Instructions),
+                content: EncodeContentForTableStorage(request.Instructions),
                 role: ChatMessageRole.System,
                 toolCalls: null);
 
@@ -304,7 +307,7 @@ class DefaultAssistantService : IAssistantService
         ChatMessageTableEntity chatMessageEntity = new(
             partitionKey: attribute.Id,
             messageIndex: ++chatState.Metadata.TotalMessages,
-            content: TruncateForTableStorage(attribute.UserMessage),
+            content: EncodeContentForTableStorage(attribute.UserMessage),
             role: ChatMessageRole.User,
             toolCalls: null);
         chatState.Messages.Add(chatMessageEntity);
@@ -370,7 +373,7 @@ class DefaultAssistantService : IAssistantService
             }
         }
 
-        IReadOnlyList<ChatMessageTableEntity> trimmedMessages = this.TrimMessagesForContextBudget(attribute.Id, attribute.ChatModel, chatState.Messages);
+        IReadOnlyList<ChatMessageTableEntity> trimmedMessages = this.TrimMessagesForContextBudget(attribute.Id, chatState.Messages);
         IEnumerable<ChatMessage> chatMessages = ToOpenAIChatRequestMessages(trimmedMessages);
 
         return await this.openAIClientFactory.GetChatClient(
@@ -380,10 +383,9 @@ class DefaultAssistantService : IAssistantService
 
     List<ChatMessageTableEntity> TrimMessagesForContextBudget(
         string assistantId,
-        string? chatModel,
         IReadOnlyList<ChatMessageTableEntity> sourceMessages)
     {
-        int effectiveContextBudget = GetMaxContextTokens(chatModel) - ReservedForResponseTokens - ReservedForFunctionTokens;
+        int effectiveContextBudget = this.GetMaxContextTokens() - ReservedForResponseTokens - ReservedForFunctionTokens;
         List<ChatMessageTableEntity> requestMessages = sourceMessages.Select(CloneChatMessageForRequest).ToList();
 
         int beforeEstimate = EstimateRequestTokens(requestMessages);
@@ -426,7 +428,9 @@ class DefaultAssistantService : IAssistantService
                 ChatMessageTableEntity messageToTrim = requestMessages[oldestNonSystemIndex];
                 int remainingTokenEstimate = afterEstimate - EstimateMessageTokens(messageToTrim);
                 int allowedTokensForMessage = Math.Max(1, effectiveContextBudget - remainingTokenEstimate);
-                messageToTrim.Content = TrimContentToEstimatedTokens(messageToTrim.Content, allowedTokensForMessage);
+                messageToTrim.Content = TrimContentToEstimatedTokens(
+                    DecodeContentFromTableStorage(messageToTrim.Content),
+                    allowedTokensForMessage);
                 afterEstimate = EstimateRequestTokens(requestMessages);
             }
         }
@@ -444,15 +448,16 @@ class DefaultAssistantService : IAssistantService
         return requestMessages;
     }
 
-    static int GetMaxContextTokens(string? chatModel)
+    int GetMaxContextTokens()
     {
-        return IsGpt54Model(chatModel) ? Gpt54MaxContextTokens : DefaultMaxContextTokens;
-    }
+        string? configuredValue = this.configuration[MaxContextTokensConfigurationKey];
+        if (int.TryParse(configuredValue, out int configuredTokens)
+            && configuredTokens > ReservedForResponseTokens + ReservedForFunctionTokens)
+        {
+            return configuredTokens;
+        }
 
-    static bool IsGpt54Model(string? chatModel)
-    {
-        return !string.IsNullOrWhiteSpace(chatModel)
-            && string.Equals(chatModel, "gpt-5.4", StringComparison.OrdinalIgnoreCase);
+        return DefaultMaxContextTokens;
     }
 
     static int FindLatestUserMessageIndex(IReadOnlyList<ChatMessageTableEntity> messages)
@@ -554,7 +559,7 @@ class DefaultAssistantService : IAssistantService
         ChatMessageTableEntity copy = new(
             partitionKey: source.PartitionKey,
             messageIndex: 0,
-            content: source.Content ?? string.Empty,
+            content: DecodeContentFromTableStorage(source.Content),
             role: ParseChatMessageRole(source.Role),
             name: source.Name,
             toolCalls: source.ToolCalls);
@@ -606,7 +611,7 @@ class DefaultAssistantService : IAssistantService
     static int EstimateMessageTokens(ChatMessageTableEntity message)
     {
         // Deterministic approximation used as a guardrail when exact tokenization is not available.
-        int contentLength = message.Content?.Length ?? 0;
+        int contentLength = DecodeContentFromTableStorage(message.Content).Length;
         int nameLength = message.Name?.Length ?? 0;
         int toolCallsLength = message.ToolCallsString?.Length ?? 0;
         int estimatedContentTokens = (contentLength + nameLength + toolCallsLength + (ApproximateCharsPerToken - 1)) / ApproximateCharsPerToken;
@@ -614,14 +619,55 @@ class DefaultAssistantService : IAssistantService
         return MessageTokenOverhead + estimatedContentTokens;
     }
 
-    static string TruncateForTableStorage(string? content)
+    static string EncodeContentForTableStorage(string? content)
     {
         if (string.IsNullOrEmpty(content) || content.Length <= MaxTableStorageStringLength)
         {
             return content ?? string.Empty;
         }
 
-        return content[..MaxTableStorageStringLength];
+        byte[] inputBytes = Encoding.UTF8.GetBytes(content);
+        using MemoryStream compressedStream = new();
+        using (GZipStream gzip = new(compressedStream, CompressionLevel.Optimal, leaveOpen: true))
+        {
+            gzip.Write(inputBytes, 0, inputBytes.Length);
+        }
+
+        string encoded = CompressedContentPrefix + Convert.ToBase64String(compressedStream.ToArray());
+        if (encoded.Length > MaxTableStorageStringLength)
+        {
+            throw new InvalidOperationException(
+                $"Chat message is too large for Azure Table Storage even after compression. " +
+                $"Original characters: {content.Length}; compressed characters: {encoded.Length}; " +
+                $"limit: {MaxTableStorageStringLength}.");
+        }
+
+        return encoded;
+    }
+
+    static string DecodeContentFromTableStorage(string? content)
+    {
+        if (string.IsNullOrEmpty(content) || !content.StartsWith(CompressedContentPrefix, StringComparison.Ordinal))
+        {
+            return content ?? string.Empty;
+        }
+
+        try
+        {
+            byte[] compressedBytes = Convert.FromBase64String(content[CompressedContentPrefix.Length..]);
+            using MemoryStream compressedStream = new(compressedBytes);
+            using GZipStream gzip = new(compressedStream, CompressionMode.Decompress);
+            using StreamReader reader = new(gzip, Encoding.UTF8);
+            return reader.ReadToEnd();
+        }
+        catch (FormatException)
+        {
+            return content;
+        }
+        catch (InvalidDataException)
+        {
+            return content;
+        }
     }
 
     static string TrimContentToEstimatedTokens(string? content, int allowedTokens)
@@ -664,7 +710,7 @@ class DefaultAssistantService : IAssistantService
         ChatMessageTableEntity replyFromAssistantEntity = new(
             partitionKey: assistantId,
             messageIndex: ++chatState.Metadata.TotalMessages,
-            content: TruncateForTableStorage(replyMessage),
+            content: EncodeContentForTableStorage(replyMessage),
             role: ChatMessageRole.Assistant,
             toolCalls: response.Value.ToolCalls);
 
@@ -727,7 +773,7 @@ class DefaultAssistantService : IAssistantService
         ChatMessageTableEntity functionResultEntity = new(
             partitionKey: assistantId,
             messageIndex: ++chatState.Metadata.TotalMessages,
-            content: TruncateForTableStorage($"Function Name: '{call.FunctionName}' and Function Result: '{functionResult}'"),
+            content: EncodeContentForTableStorage($"Function Name: '{call.FunctionName}' and Function Result: '{functionResult}'"),
             role: ChatMessageRole.Tool,
             name: call.Id,
             toolCalls: null);
@@ -794,7 +840,7 @@ class DefaultAssistantService : IAssistantService
             chatState.Metadata.LastUpdatedAt,
             chatState.Metadata.TotalMessages,
             chatState.Metadata.TotalTokens,
-            filteredChatMessages.Select(msg => new AssistantMessage(msg.Content, msg.Role, msg.ToolCallsString)).ToList());
+            filteredChatMessages.Select(msg => new AssistantMessage(DecodeContentFromTableStorage(msg.Content), msg.Role, msg.ToolCallsString)).ToList());
     }
 
     async Task<InternalChatState?> LoadChatStateAsync(string id, TableClient tableClient, CancellationToken cancellationToken)
@@ -838,7 +884,7 @@ class DefaultAssistantService : IAssistantService
             switch (entity.Role.ToLowerInvariant())
             {
                 case "user":
-                    yield return new UserChatMessage(entity.Content);
+                    yield return new UserChatMessage(DecodeContentFromTableStorage(entity.Content));
                     break;
                 case "assistant":
                     if (entity.ToolCalls != null && entity.ToolCalls.Any())
@@ -847,14 +893,14 @@ class DefaultAssistantService : IAssistantService
                     }
                     else
                     {
-                        yield return new AssistantChatMessage(entity.Content);
+                        yield return new AssistantChatMessage(DecodeContentFromTableStorage(entity.Content));
                     }
                     break;
                 case "system":
-                    yield return new SystemChatMessage(entity.Content);
+                    yield return new SystemChatMessage(DecodeContentFromTableStorage(entity.Content));
                     break;
                 case "tool":
-                    yield return new ToolChatMessage(toolCallId: entity.Name, entity.Content);
+                    yield return new ToolChatMessage(toolCallId: entity.Name, DecodeContentFromTableStorage(entity.Content));
                     break;
                 default:
                     throw new InvalidOperationException($"Unknown chat role '{entity.Role}'");
