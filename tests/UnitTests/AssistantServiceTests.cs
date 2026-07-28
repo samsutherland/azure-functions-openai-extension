@@ -183,6 +183,38 @@ public class DefaultAssistantServiceTests
     }
 
     [Fact]
+    public void ToOpenAIChatRequestMessages_WithCompressedSystemPrompt_RestoresCompleteInstructions()
+    {
+        // Arrange
+        const string assistantId = "testId";
+        string instructions = string.Join(
+            "\n",
+            Enumerable.Range(0, 1800).Select(i =>
+                $"Instruction {i:D4}: planned sessions are not completed activities; keep current-week facts grounded."));
+        string storedContent = DefaultAssistantService.EncodeContentForTableStorage(instructions);
+        var storedMessages = new[]
+        {
+            new ChatMessageTableEntity(
+                assistantId,
+                messageIndex: 1,
+                storedContent,
+                ChatMessageRole.System)
+        };
+
+        Assert.NotEqual(instructions, storedContent);
+        Assert.True(storedContent.Length <= 32000);
+
+        // Act
+        List<ChatMessage> requestMessages = DefaultAssistantService
+            .ToOpenAIChatRequestMessages(storedMessages)
+            .ToList();
+
+        // Assert
+        SystemChatMessage systemMessage = Assert.IsType<SystemChatMessage>(Assert.Single(requestMessages));
+        Assert.Equal(instructions, Assert.Single(systemMessage.Content).Text);
+    }
+
+    [Fact]
     public async Task CreateAssistantAsync_WithExistingAssistant_DeletesOldEntitiesFirst()
     {
         // Arrange

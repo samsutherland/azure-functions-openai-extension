@@ -621,7 +621,7 @@ class DefaultAssistantService : IAssistantService
         return MessageTokenOverhead + estimatedContentTokens;
     }
 
-    static string EncodeContentForTableStorage(string? content)
+    internal static string EncodeContentForTableStorage(string? content)
     {
         if (string.IsNullOrEmpty(content) || content.Length <= MaxTableStorageStringLength)
         {
@@ -879,7 +879,7 @@ class DefaultAssistantService : IAssistantService
         return new InternalChatState(id, assistantStateEntity, chatMessageList);
     }
 
-    static IEnumerable<ChatMessage> ToOpenAIChatRequestMessages(IEnumerable<ChatMessageTableEntity> entities)
+    internal static IEnumerable<ChatMessage> ToOpenAIChatRequestMessages(IEnumerable<ChatMessageTableEntity> entities)
     {
         foreach (ChatMessageTableEntity entity in entities)
         {
