@@ -257,7 +257,9 @@ class DefaultAssistantService : IAssistantService
         if (systemMessage is not null)
         {
             systemMessage.Content = EncodeContentForTableStorage(request.Instructions);
-            systemMessage.CreatedAt = DateTime.UtcNow;
+            this.logger.LogInformation(
+                "[{Id}] Existing system message found. Updating system instructions.",
+                request.Id);
             batch.Add(new TableTransactionAction(TableTransactionActionType.UpdateMerge, systemMessage));
         }
         else
