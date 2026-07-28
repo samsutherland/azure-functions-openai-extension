@@ -121,6 +121,68 @@ public class DefaultAssistantServiceTests
     }
 
     [Fact]
+    public async Task CreateAssistantAsync_WithLongInstructions_PreservesCompleteSystemPrompt()
+    {
+        // Arrange
+        string instructions = string.Join(
+            "\n",
+            Enumerable.Range(0, 1800).Select(i =>
+                $"Instruction {i:D4}: planned sessions are not completed activities; keep current-week facts grounded."));
+        var submittedActions = new List<TableTransactionAction>();
+        var request = new AssistantCreateRequest("testId", instructions)
+        {
+            CollectionName = "ChatState",
+            ChatStorageConnectionSetting = "AzureWebJobsStorage"
+        };
+
+        this.mockTableClient.Setup(x => x.CreateIfNotExistsAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Response.FromValue(new TableItem(request.CollectionName), new Mock<Response>().Object));
+
+        this.mockTableClient.Setup(x => x.QueryAsync<TableEntity>(
+                It.Is<string>(s => s == $"PartitionKey eq '{request.Id}'"),
+                null,
+                null,
+                It.IsAny<CancellationToken>()))
+            .Returns(MockAsyncPageable<TableEntity>.Create([]));
+
+        this.mockTableClient.Setup(x => x.SubmitTransactionAsync(
+                It.IsAny<IEnumerable<TableTransactionAction>>(),
+                It.IsAny<CancellationToken>()))
+            .Callback<IEnumerable<TableTransactionAction>, CancellationToken>((actions, _) =>
+                submittedActions.AddRange(actions))
+            .ReturnsAsync(Response.FromValue(new List<Response>() as IReadOnlyList<Response>, new Mock<Response>().Object));
+
+        var assistantService = new DefaultAssistantService(
+            this.mockOpenAIClientFactory.Object,
+            this.mockAzureComponentFactory.Object,
+            this.mockConfiguration.Object,
+            this.mockSkillInvoker.Object,
+            this.mockLoggerFactory.Object);
+
+        System.Reflection.FieldInfo? tableClientField = typeof(DefaultAssistantService).GetField(
+            "tableClient",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        tableClientField?.SetValue(assistantService, this.mockTableClient.Object);
+
+        // Act
+        await assistantService.CreateAssistantAsync(request, CancellationToken.None);
+
+        // Assert
+        ChatMessageTableEntity systemMessage = submittedActions
+            .Select(action => action.Entity)
+            .OfType<ChatMessageTableEntity>()
+            .Single(message => message.Role == ChatMessageRole.System.ToString());
+
+        System.Reflection.MethodInfo? decodeMethod = typeof(DefaultAssistantService).GetMethod(
+            "DecodeContentFromTableStorage",
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+
+        Assert.NotNull(decodeMethod);
+        Assert.True(systemMessage.Content.Length <= 32000);
+        Assert.Equal(instructions, decodeMethod!.Invoke(null, [systemMessage.Content]));
+    }
+
+    [Fact]
     public async Task CreateAssistantAsync_WithExistingAssistant_DeletesOldEntitiesFirst()
     {
         // Arrange
@@ -667,6 +729,134 @@ public class DefaultAssistantServiceTests
         // Act & Assert - Empty ID
         await Assert.ThrowsAsync<ArgumentException>(() =>
             assistantService.PostMessageAsync(attributeNoId, CancellationToken.None));
+    }
+
+    [Fact]
+    public void TrimMessagesForContextBudget_WithLongHistory_TrimsToEffectiveBudget()
+    {
+        // Arrange
+        const int effectiveBudget = 128000 - 1024 - 4000;
+        const string assistantId = "testId";
+
+        var assistantService = new DefaultAssistantService(
+            this.mockOpenAIClientFactory.Object,
+            this.mockAzureComponentFactory.Object,
+            this.mockConfiguration.Object,
+            this.mockSkillInvoker.Object,
+            this.mockLoggerFactory.Object);
+
+        List<ChatMessageTableEntity> messages = new()
+        {
+            new ChatMessageTableEntity(assistantId, 1, "System instructions", ChatMessageRole.System)
+        };
+
+        for (int i = 0; i < 45; i++)
+        {
+            ChatMessageRole role = i % 2 == 0 ? ChatMessageRole.User : ChatMessageRole.Assistant;
+            messages.Add(new ChatMessageTableEntity(assistantId, i + 2, new string('x', 12000), role));
+        }
+
+        messages.Add(new ChatMessageTableEntity(assistantId, messages.Count + 1, "latest-user-message", ChatMessageRole.User));
+
+        System.Reflection.MethodInfo? trimMethod = typeof(DefaultAssistantService).GetMethod(
+            "TrimMessagesForContextBudget",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        System.Reflection.MethodInfo? estimateMethod = typeof(DefaultAssistantService).GetMethod(
+            "EstimateRequestTokens",
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+
+        Assert.NotNull(trimMethod);
+        Assert.NotNull(estimateMethod);
+
+        // Act
+        var trimmedMessages = (List<ChatMessageTableEntity>)trimMethod!.Invoke(assistantService, [assistantId, messages])!;
+        int estimatedTokens = (int)estimateMethod!.Invoke(null, [trimmedMessages])!;
+
+        // Assert
+        Assert.True(estimatedTokens <= effectiveBudget);
+        Assert.True(trimmedMessages.Count < messages.Count);
+    }
+
+    [Fact]
+    public void TrimMessagesForContextBudget_WithLongHistory_RetainsNewestUserMessage()
+    {
+        // Arrange
+        const string assistantId = "testId";
+        const string latestUserMessage = "do not remove me";
+
+        var assistantService = new DefaultAssistantService(
+            this.mockOpenAIClientFactory.Object,
+            this.mockAzureComponentFactory.Object,
+            this.mockConfiguration.Object,
+            this.mockSkillInvoker.Object,
+            this.mockLoggerFactory.Object);
+
+        List<ChatMessageTableEntity> messages = new()
+        {
+            new ChatMessageTableEntity(assistantId, 1, "System instructions", ChatMessageRole.System)
+        };
+
+        for (int i = 0; i < 40; i++)
+        {
+            ChatMessageRole role = i % 2 == 0 ? ChatMessageRole.User : ChatMessageRole.Assistant;
+            messages.Add(new ChatMessageTableEntity(assistantId, i + 2, new string('y', 10000), role));
+        }
+
+        messages.Add(new ChatMessageTableEntity(assistantId, messages.Count + 1, latestUserMessage, ChatMessageRole.User));
+
+        System.Reflection.MethodInfo? trimMethod = typeof(DefaultAssistantService).GetMethod(
+            "TrimMessagesForContextBudget",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+
+        Assert.NotNull(trimMethod);
+
+        // Act
+        var trimmedMessages = (List<ChatMessageTableEntity>)trimMethod!.Invoke(assistantService, [assistantId, messages])!;
+        ChatMessageTableEntity newestUser = trimmedMessages.Last(m =>
+            string.Equals(m.Role, ChatMessageRole.User.ToString(), StringComparison.OrdinalIgnoreCase));
+
+        // Assert
+        Assert.Equal(latestUserMessage, newestUser.Content);
+    }
+
+    [Fact]
+    public void TrimMessagesForContextBudget_WithConfiguredLimit_UsesConfiguredContextBudget()
+    {
+        // Arrange
+        const string assistantId = "testId";
+        this.mockConfiguration
+            .Setup(configuration => configuration["ASSISTANT_MAX_CONTEXT_TOKENS"])
+            .Returns("900000");
+
+        var assistantService = new DefaultAssistantService(
+            this.mockOpenAIClientFactory.Object,
+            this.mockAzureComponentFactory.Object,
+            this.mockConfiguration.Object,
+            this.mockSkillInvoker.Object,
+            this.mockLoggerFactory.Object);
+
+        List<ChatMessageTableEntity> messages = new()
+        {
+            new ChatMessageTableEntity(assistantId, 1, "System instructions", ChatMessageRole.System)
+        };
+
+        for (int i = 0; i < 45; i++)
+        {
+            ChatMessageRole role = i % 2 == 0 ? ChatMessageRole.User : ChatMessageRole.Assistant;
+            messages.Add(new ChatMessageTableEntity(assistantId, i + 2, new string('z', 12000), role));
+        }
+
+        System.Reflection.MethodInfo? trimMethod = typeof(DefaultAssistantService).GetMethod(
+            "TrimMessagesForContextBudget",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+
+        Assert.NotNull(trimMethod);
+
+        // Act
+        var trimmedMessages = (List<ChatMessageTableEntity>)trimMethod!.Invoke(assistantService, [assistantId, messages])!;
+
+        // Assert
+        Assert.Equal(messages.Count, trimmedMessages.Count);
     }
 
     static Mock<IConfigurationSection> CreateMockSection(bool exists, string? tableServiceUri = null)
