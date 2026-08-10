@@ -15,6 +15,7 @@
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <EmbedUntrackedSources>true</EmbedUntrackedSources>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <PackageOutputPath Condition="'$(CI)' != 'true' and '$(TF_BUILD)' != 'True' and '$(GITHUB_ACTIONS)' != 'true'">$(MSBuildThisFileDirectory)..\local-packages</PackageOutputPath>
     <Authors>Microsoft</Authors>
     <Company>Microsoft</Company>
     <Copyright>© Microsoft Corporation. All rights reserved.</Copyright>

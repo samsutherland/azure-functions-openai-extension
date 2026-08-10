@@ -16,6 +16,14 @@
     <PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.Abstractions" Version="1.3.0" />
   </ItemGroup>
 
+  <!-- The worker SDK restores this package from the generated WorkerExtensions project.
+       Build it first so un-published versions are available from the repository-local feed. -->
+  <ItemGroup>
+    <ProjectReference Include="..\WebJobs.Extensions.OpenAI\WebJobs.Extensions.OpenAI.csproj"
+                      ReferenceOutputAssembly="false"
+                      PrivateAssets="all" />
+  </ItemGroup>
+
   <ItemGroup>
     <AssemblyAttribute Include="Microsoft.Azure.Functions.Worker.Extensions.Abstractions.ExtensionInformationAttribute">
       <_Parameter1>Streeka.Azure.WebJobs.Extensions.OpenAI</_Parameter1>
