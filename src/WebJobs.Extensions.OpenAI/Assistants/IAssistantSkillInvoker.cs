@@ -205,7 +205,9 @@ public class AssistantSkillManager : IAssistantSkillInvoker
         // Convert the output to JSON
         string jsonResult = JsonConvert.SerializeObject(skillInvocationContext.Result);
         this.logger.LogInformation(
-            "Returning output of user-code function '{Name}' as JSON: {Json}", call.FunctionName, jsonResult);
+            "Returning output of user-code function '{Name}' as JSON ({Length} characters)",
+            call.FunctionName,
+            jsonResult.Length);
         return jsonResult;
     }
 }

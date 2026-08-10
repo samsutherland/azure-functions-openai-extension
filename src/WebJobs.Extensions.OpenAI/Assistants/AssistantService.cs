@@ -323,6 +323,7 @@ class DefaultAssistantService : IAssistantService
         CancellationToken cancellationToken)
     {
         IList<ChatTool>? functions = this.skillInvoker.GetFunctionsDefinitions();
+        AssistantToolWorkflow workflow = new();
 
         // We loop if the model returns function calls. Otherwise, we break after receiving a response.
         while (true)
@@ -356,7 +357,7 @@ class DefaultAssistantService : IAssistantService
             }
 
             // Process function calls
-            await this.ProcessFunctionCalls(attribute.Id, functionCalls, chatState, batch, cancellationToken);
+            await this.ProcessFunctionCalls(attribute.Id, functionCalls, chatState, batch, workflow, cancellationToken);
         }
     }
 
@@ -739,6 +740,7 @@ class DefaultAssistantService : IAssistantService
         List<ChatToolCall> functionCalls,
         InternalChatState chatState,
         List<TableTransactionAction> batch,
+        AssistantToolWorkflow workflow,
         CancellationToken cancellationToken)
     {
         this.logger.LogInformation(
@@ -746,27 +748,79 @@ class DefaultAssistantService : IAssistantService
             assistantId,
             functionCalls.Count);
 
+        bool failedMutationInBatch = false;
         foreach (ChatToolCall call in functionCalls)
         {
-            await this.ProcessSingleFunctionCall(assistantId, call, chatState, batch, cancellationToken);
+            string? functionResult;
+            if (workflow.IsDuplicateFailedRequest(call))
+            {
+                functionResult = AssistantToolWorkflow.DuplicateFailureResult(call.FunctionName);
+                this.logger.LogWarning(
+                    "[{Id}] Blocked identical failed tool request function={Name} fingerprint={Fingerprint}",
+                    assistantId,
+                    call.FunctionName,
+                    AssistantToolWorkflow.Fingerprint(call));
+            }
+            else if (failedMutationInBatch && AssistantToolWorkflow.IsMutation(call.FunctionName))
+            {
+                functionResult = AssistantToolWorkflow.DependencyFailureResult(call.FunctionName);
+                this.logger.LogWarning(
+                    "[{Id}] Blocked dependent mutation function={Name} after an earlier mutation failed",
+                    assistantId,
+                    call.FunctionName);
+            }
+            else
+            {
+                functionResult = await this.InvokeFunctionWithSafeCorrection(
+                    assistantId,
+                    call,
+                    workflow,
+                    cancellationToken);
+            }
+
+            this.AddFunctionResult(assistantId, call, functionResult, chatState, batch);
+            workflow.Record(call, functionResult);
+            failedMutationInBatch |= AssistantToolWorkflow.IsMutation(call.FunctionName)
+                                     && AssistantToolWorkflow.IsFailure(functionResult);
         }
     }
 
-    async Task ProcessSingleFunctionCall(
+    async Task<string?> InvokeFunctionWithSafeCorrection(
         string assistantId,
         ChatToolCall call,
-        InternalChatState chatState,
-        List<TableTransactionAction> batch,
+        AssistantToolWorkflow workflow,
         CancellationToken cancellationToken)
     {
         this.logger.LogInformation(
-            "[{Id}] Calling function '{Name}' with arguments: {Args}",
+            "[{Id}] Calling function={Name} fingerprint={Fingerprint}",
             assistantId,
             call.FunctionName,
-            call.FunctionArguments);
+            AssistantToolWorkflow.Fingerprint(call));
 
         string? functionResult = await this.InvokeFunctionWithErrorHandling(assistantId, call, cancellationToken);
+        if (AssistantToolWorkflow.IsFailure(functionResult)
+            && AssistantToolWorkflow.TryCreateSafeCorrection(call, functionResult, out ChatToolCall? correctedCall))
+        {
+            this.logger.LogInformation(
+                "[{Id}] Applying one safe tool correction function={Name} originalFingerprint={OriginalFingerprint} correctedFingerprint={CorrectedFingerprint}",
+                assistantId,
+                call.FunctionName,
+                AssistantToolWorkflow.Fingerprint(call),
+                AssistantToolWorkflow.Fingerprint(correctedCall!));
+            functionResult = await this.InvokeFunctionWithErrorHandling(assistantId, correctedCall!, cancellationToken);
+            workflow.Record(correctedCall!, functionResult);
+        }
 
+        return functionResult;
+    }
+
+    void AddFunctionResult(
+        string assistantId,
+        ChatToolCall call,
+        string? functionResult,
+        InternalChatState chatState,
+        List<TableTransactionAction> batch)
+    {
         if (string.IsNullOrWhiteSpace(functionResult))
         {
             functionResult = "The function call succeeded. Let the user know that you completed the action.";
@@ -796,10 +850,11 @@ class DefaultAssistantService : IAssistantService
             string? result = await this.skillInvoker.InvokeAsync(call, cancellationToken);
 
             this.logger.LogInformation(
-                "[{id}] Function '{Name}' returned the following content: {Content}",
+                "[{id}] Function={Name} completed failed={Failed} resultLength={ResultLength}",
                 assistantId,
                 call.FunctionName,
-                result);
+                AssistantToolWorkflow.IsFailure(result),
+                result?.Length ?? 0);
 
             return result;
         }

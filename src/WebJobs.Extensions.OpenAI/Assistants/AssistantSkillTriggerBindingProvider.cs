@@ -7,6 +7,7 @@ using Microsoft.Azure.WebJobs.Host.Bindings;
 using Microsoft.Azure.WebJobs.Host.Listeners;
 using Microsoft.Azure.WebJobs.Host.Protocols;
 using Microsoft.Azure.WebJobs.Host.Triggers;
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
 namespace Microsoft.Azure.WebJobs.Extensions.OpenAI.Assistants;
@@ -115,10 +116,15 @@ class AssistantSkillTriggerBindingProvider : ITriggerBindingProvider
             object? convertedValue;
             if (!string.IsNullOrEmpty(skillInvocationContext.Arguments?.ToString()))
             {
-                // We expect that input to always be a string value in the form {"paramName":paramValue}
+                // Prefer the named parameter, but accept direct typed JSON for string-backed skills.
+                // The direct form is the public contract; {"input":"{...}"} remains supported while
+                // callers migrate away from the legacy serialized wrapper.
                 JObject argsJson = JObject.Parse(skillInvocationContext.Arguments.ToString());
                 JToken? paramValue = argsJson[this.parameterInfo.Name];
-                convertedValue = paramValue?.ToObject(destinationType);
+                convertedValue = AssistantSkillArgumentNormalizer.Convert(
+                    argsJson,
+                    paramValue,
+                    destinationType);
             }
             else
             {
@@ -225,5 +231,25 @@ class AssistantSkillTriggerBindingProvider : ITriggerBindingProvider
             {
             }
         }
+    }
+}
+
+internal static class AssistantSkillArgumentNormalizer
+{
+    internal static object? Convert(JObject arguments, JToken? namedValue, Type destinationType)
+    {
+        if (destinationType != typeof(string))
+        {
+            return namedValue?.ToObject(destinationType);
+        }
+
+        if (namedValue is null)
+        {
+            return arguments.ToString(Formatting.None);
+        }
+
+        return namedValue.Type == JTokenType.String
+            ? namedValue.Value<string>()
+            : namedValue.ToString(Formatting.None);
     }
 }

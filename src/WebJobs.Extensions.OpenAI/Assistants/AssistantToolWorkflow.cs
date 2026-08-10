@@ -1,0 +1,182 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+using System.Security.Cryptography;
+using System.Text;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using OpenAI.Chat;
+
+namespace Microsoft.Azure.WebJobs.Extensions.OpenAI.Assistants;
+
+internal sealed class AssistantToolWorkflow
+{
+    readonly HashSet<string> failedRequests = new(StringComparer.Ordinal);
+
+    internal bool IsDuplicateFailedRequest(ChatToolCall call) =>
+        this.failedRequests.Contains(Fingerprint(call));
+
+    internal void Record(ChatToolCall call, string? result)
+    {
+        if (IsFailure(result))
+        {
+            this.failedRequests.Add(Fingerprint(call));
+        }
+    }
+
+    internal static bool IsMutation(string? functionName)
+    {
+        if (string.IsNullOrWhiteSpace(functionName))
+        {
+            return false;
+        }
+
+        return functionName.StartsWith("Set", StringComparison.OrdinalIgnoreCase)
+            || functionName.StartsWith("Add", StringComparison.OrdinalIgnoreCase)
+            || functionName.StartsWith("Update", StringComparison.OrdinalIgnoreCase)
+            || functionName.StartsWith("Replace", StringComparison.OrdinalIgnoreCase)
+            || functionName.StartsWith("Delete", StringComparison.OrdinalIgnoreCase)
+            || functionName.StartsWith("Patch", StringComparison.OrdinalIgnoreCase)
+            || functionName.StartsWith("Generate", StringComparison.OrdinalIgnoreCase)
+            || functionName.StartsWith("Finalize", StringComparison.OrdinalIgnoreCase)
+            || functionName.StartsWith("Sync", StringComparison.OrdinalIgnoreCase)
+            || functionName.StartsWith("Confirm", StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal static bool IsFailure(string? result)
+    {
+        JToken? token = ParseResult(result);
+        if (token is JObject obj)
+        {
+            if (obj.TryGetValue("success", StringComparison.OrdinalIgnoreCase, out JToken? success)
+                && success.Type == JTokenType.Boolean)
+            {
+                return !success.Value<bool>();
+            }
+
+            string? outcome = obj.GetValue("outcome", StringComparison.OrdinalIgnoreCase)?.Value<string>();
+            return outcome is "assistant_retry_required" or "needs_user_input" or "needs_reconciliation"
+                or "constraint_violation" or "failed";
+        }
+
+        string? text = token?.Value<string>() ?? result;
+        return !string.IsNullOrWhiteSpace(text)
+            && (text.Contains(" is required", StringComparison.OrdinalIgnoreCase)
+                || text.Contains(" failed", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("invalid ", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("not persist", StringComparison.OrdinalIgnoreCase));
+    }
+
+    internal static bool TryCreateSafeCorrection(
+        ChatToolCall call,
+        string? result,
+        out ChatToolCall? correctedCall)
+    {
+        correctedCall = null;
+        if (ParseResult(result) is not JObject obj
+            || obj.GetValue("safeAutomaticCorrection", StringComparison.OrdinalIgnoreCase)?.Value<bool>() != true
+            || obj.GetValue("correctedArguments", StringComparison.OrdinalIgnoreCase) is not JObject correctedArguments)
+        {
+            return false;
+        }
+
+        string correctedJson = correctedArguments.ToString(Formatting.None);
+        if (Canonicalize(call.FunctionArguments.ToString()) == Canonicalize(correctedJson))
+        {
+            return false;
+        }
+
+        correctedCall = ChatToolCall.CreateFunctionToolCall(
+            call.Id,
+            call.FunctionName,
+            BinaryData.FromString(correctedJson));
+        return true;
+    }
+
+    internal static string Fingerprint(ChatToolCall call)
+    {
+        string canonical = $"{call.FunctionName}\n{Canonicalize(call.FunctionArguments.ToString())}";
+        using SHA256 sha = SHA256.Create();
+        byte[] digest = sha.ComputeHash(Encoding.UTF8.GetBytes(canonical));
+        return BitConverter.ToString(digest, 0, 8).Replace("-", string.Empty).ToLowerInvariant();
+    }
+
+    internal static string DuplicateFailureResult(string functionName) =>
+        JsonConvert.SerializeObject(new
+        {
+            success = false,
+            outcome = "duplicate_failed_request",
+            errorCode = "identical_failed_request",
+            operation = functionName,
+            retryable = false,
+            assistantInstruction = "Do not submit the identical payload again. Change the arguments using the prior correction guidance, or disclose that the operation was not saved."
+        });
+
+    internal static string DependencyFailureResult(string functionName) =>
+        JsonConvert.SerializeObject(new
+        {
+            success = false,
+            outcome = "dependency_failed",
+            errorCode = "prior_mutation_failed",
+            operation = functionName,
+            retryable = true,
+            assistantInstruction = "A prior write in this batch failed, so this write was not attempted. Repair and verify the failed operation before continuing."
+        });
+
+    static JToken? ParseResult(string? result)
+    {
+        if (string.IsNullOrWhiteSpace(result))
+        {
+            return null;
+        }
+
+        try
+        {
+            JToken token = JToken.Parse(result);
+            for (int i = 0; i < 2 && token.Type == JTokenType.String; i++)
+            {
+                string? nested = token.Value<string>();
+                if (string.IsNullOrWhiteSpace(nested))
+                {
+                    break;
+                }
+
+                try
+                {
+                    token = JToken.Parse(nested);
+                }
+                catch (JsonReaderException)
+                {
+                    break;
+                }
+            }
+
+            return token;
+        }
+        catch (JsonReaderException)
+        {
+            return new JValue(result);
+        }
+    }
+
+    static string Canonicalize(string json)
+    {
+        try
+        {
+            return SortToken(JToken.Parse(json)).ToString(Formatting.None);
+        }
+        catch (JsonReaderException)
+        {
+            return json.Trim();
+        }
+    }
+
+    static JToken SortToken(JToken token) => token switch
+    {
+        JObject obj => new JObject(obj.Properties()
+            .OrderBy(property => property.Name, StringComparer.Ordinal)
+            .Select(property => new JProperty(property.Name, SortToken(property.Value)))),
+        JArray array => new JArray(array.Select(SortToken)),
+        _ => token.DeepClone()
+    };
+}
