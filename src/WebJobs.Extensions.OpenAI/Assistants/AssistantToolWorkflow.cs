@@ -13,6 +13,40 @@ internal sealed class AssistantToolWorkflow
 {
     readonly HashSet<string> failedRequests = new(StringComparer.Ordinal);
 
+    internal async Task<IReadOnlyList<ToolExecution>> ExecuteSequentialAsync(
+        IReadOnlyList<ChatToolCall> calls,
+        Func<ChatToolCall, Task<string?>> invokeAsync)
+    {
+        var executions = new List<ToolExecution>(calls.Count);
+        bool failedMutationInBatch = false;
+        foreach (ChatToolCall call in calls)
+        {
+            string? result;
+            ToolExecutionDisposition disposition;
+            if (this.IsDuplicateFailedRequest(call))
+            {
+                result = DuplicateFailureResult(call.FunctionName);
+                disposition = ToolExecutionDisposition.DuplicateBlocked;
+            }
+            else if (failedMutationInBatch && IsMutation(call.FunctionName))
+            {
+                result = DependencyFailureResult(call.FunctionName);
+                disposition = ToolExecutionDisposition.DependencyBlocked;
+            }
+            else
+            {
+                result = await invokeAsync(call);
+                disposition = ToolExecutionDisposition.Invoked;
+            }
+
+            this.Record(call, result);
+            failedMutationInBatch |= IsMutation(call.FunctionName) && IsFailure(result);
+            executions.Add(new ToolExecution(call, result, disposition));
+        }
+
+        return executions;
+    }
+
     internal bool IsDuplicateFailedRequest(ChatToolCall call) =>
         this.failedRequests.Contains(Fingerprint(call));
 
@@ -179,4 +213,16 @@ internal sealed class AssistantToolWorkflow
         JArray array => new JArray(array.Select(SortToken)),
         _ => token.DeepClone()
     };
+
+    internal sealed record ToolExecution(
+        ChatToolCall Call,
+        string? Result,
+        ToolExecutionDisposition Disposition);
+
+    internal enum ToolExecutionDisposition
+    {
+        Invoked,
+        DuplicateBlocked,
+        DependencyBlocked
+    }
 }

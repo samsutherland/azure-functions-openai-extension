@@ -103,6 +103,54 @@ public class AssistantToolWorkflowTests
         Assert.Contains("was not attempted", result);
     }
 
+    [Fact]
+    public async Task MultipleDateMutations_RunSequentiallyAndReturnPerCallResults()
+    {
+        var workflow = new AssistantToolWorkflow();
+        ChatToolCall first = Call("call-1", "ReplaceWeeklyWorkoutSkill", """{"date":"2030-01-02"}""");
+        ChatToolCall second = Call("call-2", "ReplaceWeeklyWorkoutSkill", """{"date":"2030-01-03"}""");
+        var invocationOrder = new List<string>();
+        bool invocationInProgress = false;
+
+        IReadOnlyList<AssistantToolWorkflow.ToolExecution> results =
+            await workflow.ExecuteSequentialAsync([first, second], async call =>
+            {
+                Assert.False(invocationInProgress);
+                invocationInProgress = true;
+                invocationOrder.Add(call.Id);
+                await Task.Yield();
+                invocationInProgress = false;
+                return $$"""{"success":true,"date":"{{call.Id}}"}""";
+            });
+
+        Assert.Equal(["call-1", "call-2"], invocationOrder);
+        Assert.Equal(2, results.Count);
+        Assert.All(results, result =>
+            Assert.Equal(AssistantToolWorkflow.ToolExecutionDisposition.Invoked, result.Disposition));
+        Assert.Contains("call-1", results[0].Result);
+        Assert.Contains("call-2", results[1].Result);
+    }
+
+    [Fact]
+    public async Task FailedReplacement_BlocksDependentFinalization()
+    {
+        var workflow = new AssistantToolWorkflow();
+        ChatToolCall replacement = Call("call-1", "ReplaceWeeklyWorkoutSkill", """{"date":"2030-01-02"}""");
+        ChatToolCall finalization = Call("call-2", "FinalizeWeeklyPlanSkill", """{"weeklyPlanId":7}""");
+        int invocationCount = 0;
+
+        IReadOnlyList<AssistantToolWorkflow.ToolExecution> results =
+            await workflow.ExecuteSequentialAsync([replacement, finalization], call =>
+            {
+                invocationCount++;
+                return Task.FromResult<string?>("""{"success":false,"errorCode":"persistence_failed"}""");
+            });
+
+        Assert.Equal(1, invocationCount);
+        Assert.Equal(AssistantToolWorkflow.ToolExecutionDisposition.DependencyBlocked, results[1].Disposition);
+        Assert.Contains("prior_mutation_failed", results[1].Result);
+    }
+
     static ChatToolCall Call(string id, string name, string arguments) =>
         ChatToolCall.CreateFunctionToolCall(id, name, BinaryData.FromString(arguments));
 }

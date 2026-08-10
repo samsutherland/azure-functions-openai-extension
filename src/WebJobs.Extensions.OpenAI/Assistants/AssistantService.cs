@@ -748,40 +748,39 @@ class DefaultAssistantService : IAssistantService
             assistantId,
             functionCalls.Count);
 
-        bool failedMutationInBatch = false;
-        foreach (ChatToolCall call in functionCalls)
-        {
-            string? functionResult;
-            if (workflow.IsDuplicateFailedRequest(call))
-            {
-                functionResult = AssistantToolWorkflow.DuplicateFailureResult(call.FunctionName);
-                this.logger.LogWarning(
-                    "[{Id}] Blocked identical failed tool request function={Name} fingerprint={Fingerprint}",
-                    assistantId,
-                    call.FunctionName,
-                    AssistantToolWorkflow.Fingerprint(call));
-            }
-            else if (failedMutationInBatch && AssistantToolWorkflow.IsMutation(call.FunctionName))
-            {
-                functionResult = AssistantToolWorkflow.DependencyFailureResult(call.FunctionName);
-                this.logger.LogWarning(
-                    "[{Id}] Blocked dependent mutation function={Name} after an earlier mutation failed",
-                    assistantId,
-                    call.FunctionName);
-            }
-            else
-            {
-                functionResult = await this.InvokeFunctionWithSafeCorrection(
+        IReadOnlyList<AssistantToolWorkflow.ToolExecution> executions =
+            await workflow.ExecuteSequentialAsync(
+                functionCalls,
+                call => this.InvokeFunctionWithSafeCorrection(
                     assistantId,
                     call,
                     workflow,
-                    cancellationToken);
+                    cancellationToken));
+
+        foreach (AssistantToolWorkflow.ToolExecution execution in executions)
+        {
+            if (execution.Disposition == AssistantToolWorkflow.ToolExecutionDisposition.DuplicateBlocked)
+            {
+                this.logger.LogWarning(
+                    "[{Id}] Blocked identical failed tool request function={Name} fingerprint={Fingerprint}",
+                    assistantId,
+                    execution.Call.FunctionName,
+                    AssistantToolWorkflow.Fingerprint(execution.Call));
+            }
+            else if (execution.Disposition == AssistantToolWorkflow.ToolExecutionDisposition.DependencyBlocked)
+            {
+                this.logger.LogWarning(
+                    "[{Id}] Blocked dependent mutation function={Name} after an earlier mutation failed",
+                    assistantId,
+                    execution.Call.FunctionName);
             }
 
-            this.AddFunctionResult(assistantId, call, functionResult, chatState, batch);
-            workflow.Record(call, functionResult);
-            failedMutationInBatch |= AssistantToolWorkflow.IsMutation(call.FunctionName)
-                                     && AssistantToolWorkflow.IsFailure(functionResult);
+            this.AddFunctionResult(
+                assistantId,
+                execution.Call,
+                execution.Result,
+                chatState,
+                batch);
         }
     }
 
