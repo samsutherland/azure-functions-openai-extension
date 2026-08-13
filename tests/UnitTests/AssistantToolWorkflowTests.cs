@@ -50,6 +50,19 @@ public class AssistantToolWorkflowTests
     }
 
     [Fact]
+    public void ArgumentNormalizer_RepairsSurplusTrailingDelimiterInLegacySerializedInput()
+    {
+        JObject arguments = JObject.Parse("""{"input":"{\"userId\":42}}"}""");
+
+        var normalized = Assert.IsType<string>(AssistantSkillArgumentNormalizer.Convert(
+            arguments,
+            arguments["input"],
+            typeof(string)));
+
+        Assert.Equal("""{"userId":42}""", normalized);
+    }
+
+    [Fact]
     public void FailedRequest_IdenticalPayloadIsBlockedButChangedPayloadIsAllowed()
     {
         var workflow = new AssistantToolWorkflow();
@@ -101,6 +114,15 @@ public class AssistantToolWorkflowTests
         Assert.Contains("\"outcome\":\"dependency_failed\"", result);
         Assert.Contains("\"errorCode\":\"prior_mutation_failed\"", result);
         Assert.Contains("was not attempted", result);
+    }
+
+    [Theory]
+    [InlineData("[]")]
+    [InlineData("[{\"goal\":\"Finish the event\"}]")]
+    [InlineData("\"[]\"")]
+    public void JsonArrayResult_IsSuccessfulData(string result)
+    {
+        Assert.False(AssistantToolWorkflow.IsFailure(result));
     }
 
     [Fact]

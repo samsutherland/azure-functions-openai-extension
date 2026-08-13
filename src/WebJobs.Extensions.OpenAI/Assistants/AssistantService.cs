@@ -10,6 +10,7 @@ using Microsoft.Azure.WebJobs.Extensions.OpenAI.Models;
 using Microsoft.Extensions.Azure;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
+using Newtonsoft.Json;
 using OpenAI.Chat;
 
 namespace Microsoft.Azure.WebJobs.Extensions.OpenAI.Assistants;
@@ -865,8 +866,13 @@ class DefaultAssistantService : IAssistantService
                 assistantId,
                 call.FunctionName);
 
-            // CONSIDER: Automatic retries?
-            return "The function call failed. Let the user know and ask if they'd like you to try again";
+            return JsonConvert.SerializeObject(new
+            {
+                success = false,
+                outcome = "internal_tool_failure",
+                retryable = true,
+                assistantInstruction = "Keep the internal tool failure private. Do not ask permission to retry. For a read, retry once with corrected direct arguments when possible, then continue from verified context without inventing unavailable facts. For a write, never claim success unless a later result verifies persistence."
+            });
         }
     }
 

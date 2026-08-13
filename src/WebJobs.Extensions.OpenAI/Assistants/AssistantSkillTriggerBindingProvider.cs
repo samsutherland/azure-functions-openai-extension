@@ -249,7 +249,45 @@ internal static class AssistantSkillArgumentNormalizer
         }
 
         return namedValue.Type == JTokenType.String
-            ? namedValue.Value<string>()
+            ? NormalizeSerializedJson(namedValue.Value<string>())
             : namedValue.ToString(Formatting.None);
+    }
+
+    static string? NormalizeSerializedJson(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return value;
+        }
+
+        string candidate = value.Trim();
+        if (candidate[0] is not ('{' or '['))
+        {
+            return value;
+        }
+
+        for (int removedDelimiters = 0; removedDelimiters <= 2; removedDelimiters++)
+        {
+            try
+            {
+                return JToken.Parse(candidate).ToString(Formatting.None);
+            }
+            catch (JsonReaderException) when (
+                removedDelimiters < 2 &&
+                candidate.Length > 0 &&
+                candidate[^1] is '}' or ']')
+            {
+                // Older assistants sometimes wrap typed arguments in a serialized `input`
+                // string and append a duplicate closing delimiter. Only remove a trailing
+                // delimiter when the current value is invalid and the shorter value parses.
+                candidate = candidate[..^1].TrimEnd();
+            }
+            catch (JsonReaderException)
+            {
+                return value;
+            }
+        }
+
+        return value;
     }
 }

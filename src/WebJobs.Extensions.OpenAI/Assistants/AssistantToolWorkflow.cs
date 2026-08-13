@@ -93,7 +93,15 @@ internal sealed class AssistantToolWorkflow
                 or "constraint_violation" or "failed";
         }
 
-        string? text = token?.Value<string>() ?? result;
+        if (token is not JValue { Type: JTokenType.String } scalar)
+        {
+            // Arrays and other non-object JSON values are valid tool data. In particular,
+            // read skills commonly return a top-level array, which must not be coerced
+            // through JToken.Value<string>() (that throws for JArray).
+            return false;
+        }
+
+        string? text = scalar.Value<string>();
         return !string.IsNullOrWhiteSpace(text)
             && (text.Contains(" is required", StringComparison.OrdinalIgnoreCase)
                 || text.Contains(" failed", StringComparison.OrdinalIgnoreCase)
