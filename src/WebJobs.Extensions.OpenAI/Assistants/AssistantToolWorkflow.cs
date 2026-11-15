@@ -12,6 +12,28 @@ namespace Microsoft.Azure.WebJobs.Extensions.OpenAI.Assistants;
 internal sealed class AssistantToolWorkflow
 {
     readonly HashSet<string> failedRequests = new(StringComparer.Ordinal);
+    readonly HashSet<string> failedOperations = new(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<string, HashSet<string>> prerequisitesByDependent = new(StringComparer.OrdinalIgnoreCase);
+
+    internal AssistantToolWorkflow(IEnumerable<DependencyRule>? dependencyRules = null)
+    {
+        foreach (DependencyRule rule in dependencyRules ?? Enumerable.Empty<DependencyRule>())
+        {
+            if (string.IsNullOrWhiteSpace(rule.PrerequisiteOperation)
+                || string.IsNullOrWhiteSpace(rule.DependentOperation))
+            {
+                continue;
+            }
+
+            if (!this.prerequisitesByDependent.TryGetValue(rule.DependentOperation, out HashSet<string>? prerequisites))
+            {
+                prerequisites = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                this.prerequisitesByDependent.Add(rule.DependentOperation, prerequisites);
+            }
+
+            prerequisites.Add(rule.PrerequisiteOperation);
+        }
+    }
 
     internal async Task<IReadOnlyList<ToolExecution>> ExecuteSequentialAsync(
         IReadOnlyList<ChatToolCall> calls,
@@ -29,6 +51,11 @@ internal sealed class AssistantToolWorkflow
                 disposition = ToolExecutionDisposition.DuplicateBlocked;
             }
             else if (failedMutationInBatch && IsMutation(call.FunctionName))
+            {
+                result = DependencyFailureResult(call.FunctionName);
+                disposition = ToolExecutionDisposition.DependencyBlocked;
+            }
+            else if (this.HasFailedPrerequisite(call.FunctionName))
             {
                 result = DependencyFailureResult(call.FunctionName);
                 disposition = ToolExecutionDisposition.DependencyBlocked;
@@ -55,8 +82,17 @@ internal sealed class AssistantToolWorkflow
         if (IsFailure(result))
         {
             this.failedRequests.Add(Fingerprint(call));
+            this.failedOperations.Add(call.FunctionName);
+            return;
         }
+
+        this.failedOperations.Remove(call.FunctionName);
     }
+
+    bool HasFailedPrerequisite(string? functionName) =>
+        !string.IsNullOrWhiteSpace(functionName)
+        && this.prerequisitesByDependent.TryGetValue(functionName, out HashSet<string>? prerequisites)
+        && prerequisites.Overlaps(this.failedOperations);
 
     internal static bool IsMutation(string? functionName)
     {
@@ -247,6 +283,8 @@ internal sealed class AssistantToolWorkflow
         ChatToolCall Call,
         string? Result,
         ToolExecutionDisposition Disposition);
+
+    internal sealed record DependencyRule(string PrerequisiteOperation, string DependentOperation);
 
     internal enum ToolExecutionDisposition
     {

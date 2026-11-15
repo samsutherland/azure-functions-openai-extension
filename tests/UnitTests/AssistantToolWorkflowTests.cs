@@ -204,6 +204,56 @@ public class AssistantToolWorkflowTests
         Assert.Contains("prior_mutation_failed", results[1].Result);
     }
 
+    [Fact]
+    public async Task FailedPrerequisiteAcrossBatches_BlocksOnlyItsDeclaredDependentOperation()
+    {
+        var workflow = new AssistantToolWorkflow(
+        [
+            new AssistantToolWorkflow.DependencyRule(
+                "GetTrainingSetupStatusSkill",
+                "GenerateWeeklyPlanSkill")
+        ]);
+        ChatToolCall setup = Call("call-1", "GetTrainingSetupStatusSkill", """{"externalUserId":"athlete"}""");
+        ChatToolCall plan = Call("call-2", "GenerateWeeklyPlanSkill", """{"externalUserId":"athlete"}""");
+        ChatToolCall unrelatedRead = Call("call-3", "GetWeeklyPlanSummarySkill", """{"externalUserId":"athlete"}""");
+        var invoked = new List<string>();
+
+        await workflow.ExecuteSequentialAsync([setup], call =>
+            Task.FromResult<string?>("""{"success":false,"outcome":"failed"}"""));
+
+        IReadOnlyList<AssistantToolWorkflow.ToolExecution> secondBatch =
+            await workflow.ExecuteSequentialAsync([plan, unrelatedRead], call =>
+            {
+                invoked.Add(call.FunctionName);
+                return Task.FromResult<string?>("""{"success":true}""");
+            });
+
+        Assert.Equal(["GetWeeklyPlanSummarySkill"], invoked);
+        Assert.Equal(AssistantToolWorkflow.ToolExecutionDisposition.DependencyBlocked, secondBatch[0].Disposition);
+        Assert.Equal(AssistantToolWorkflow.ToolExecutionDisposition.Invoked, secondBatch[1].Disposition);
+    }
+
+    [Fact]
+    public async Task VerifiedPrerequisiteRetry_ClearsItsCrossBatchDependencyBlock()
+    {
+        var workflow = new AssistantToolWorkflow(
+        [
+            new AssistantToolWorkflow.DependencyRule(
+                "GetTrainingSetupStatusSkill",
+                "GenerateWeeklyPlanSkill")
+        ]);
+        ChatToolCall failedSetup = Call("call-1", "GetTrainingSetupStatusSkill", """{"externalUserId":"athlete","attempt":1}""");
+        ChatToolCall recoveredSetup = Call("call-2", "GetTrainingSetupStatusSkill", """{"externalUserId":"athlete","attempt":2}""");
+        ChatToolCall plan = Call("call-3", "GenerateWeeklyPlanSkill", """{"externalUserId":"athlete"}""");
+
+        await workflow.ExecuteSequentialAsync([failedSetup], _ => Task.FromResult<string?>("""{"success":false}"""));
+        await workflow.ExecuteSequentialAsync([recoveredSetup], _ => Task.FromResult<string?>("""{"success":true}"""));
+        IReadOnlyList<AssistantToolWorkflow.ToolExecution> results =
+            await workflow.ExecuteSequentialAsync([plan], _ => Task.FromResult<string?>("""{"success":true}"""));
+
+        Assert.Equal(AssistantToolWorkflow.ToolExecutionDisposition.Invoked, Assert.Single(results).Disposition);
+    }
+
     static ChatToolCall Call(string id, string name, string arguments) =>
         ChatToolCall.CreateFunctionToolCall(id, name, BinaryData.FromString(arguments));
 }
