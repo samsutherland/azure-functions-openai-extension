@@ -79,6 +79,11 @@ internal sealed class AssistantToolWorkflow
 
     internal static bool IsFailure(string? result)
     {
+        if (string.IsNullOrWhiteSpace(result))
+        {
+            return true;
+        }
+
         JToken? token = ParseResult(result);
         if (token is JObject obj)
         {
@@ -164,6 +169,22 @@ internal sealed class AssistantToolWorkflow
             retryable = true,
             assistantInstruction = "A prior write in this batch failed, so this write was not attempted. Repair and verify the failed operation before continuing."
         });
+
+    internal static string MissingResultFailureResult(string functionName) =>
+        JsonConvert.SerializeObject(new
+        {
+            success = false,
+            outcome = "missing_tool_result",
+            errorCode = "missing_tool_result",
+            operation = functionName,
+            retryable = false,
+            assistantInstruction = "The tool returned no result. Treat the operation as unverified: do not claim it was completed, saved, or synced. Re-read the affected state before retrying any write."
+        });
+
+    internal static string NormalizeResult(string functionName, string? result) =>
+        string.IsNullOrWhiteSpace(result)
+            ? MissingResultFailureResult(functionName)
+            : result;
 
     static JToken? ParseResult(string? result)
     {

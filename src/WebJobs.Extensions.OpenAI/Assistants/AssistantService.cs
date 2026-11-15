@@ -821,10 +821,7 @@ class DefaultAssistantService : IAssistantService
         InternalChatState chatState,
         List<TableTransactionAction> batch)
     {
-        if (string.IsNullOrWhiteSpace(functionResult))
-        {
-            functionResult = "The function call succeeded. Let the user know that you completed the action.";
-        }
+        functionResult = AssistantToolWorkflow.NormalizeResult(call.FunctionName, functionResult);
 
         ChatMessageTableEntity functionResultEntity = new(
             partitionKey: assistantId,

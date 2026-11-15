@@ -125,6 +125,37 @@ public class AssistantToolWorkflowTests
         Assert.False(AssistantToolWorkflow.IsFailure(result));
     }
 
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void EmptyToolResult_IsFailureBecauseNoOutcomeWasVerified(string? result)
+    {
+        Assert.True(AssistantToolWorkflow.IsFailure(result));
+    }
+
+    [Fact]
+    public void MissingToolResult_ProducesAnExplicitUnverifiedFailure()
+    {
+        string result = AssistantToolWorkflow.MissingResultFailureResult("SetPowerZonesSkill");
+
+        Assert.True(AssistantToolWorkflow.IsFailure(result));
+        Assert.Contains("\"outcome\":\"missing_tool_result\"", result);
+        Assert.Contains("\"operation\":\"SetPowerZonesSkill\"", result);
+        Assert.DoesNotContain("succeeded", result, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void NormalizeResult_ConvertsEmptyToolResultsToTheUnverifiedFailure(string? result)
+    {
+        string normalized = AssistantToolWorkflow.NormalizeResult("SetPowerZonesSkill", result);
+
+        Assert.Contains("\"outcome\":\"missing_tool_result\"", normalized);
+    }
+
     [Fact]
     public async Task MultipleDateMutations_RunSequentiallyAndReturnPerCallResults()
     {
