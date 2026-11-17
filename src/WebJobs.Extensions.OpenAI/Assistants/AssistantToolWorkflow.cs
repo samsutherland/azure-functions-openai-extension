@@ -35,6 +35,21 @@ internal sealed class AssistantToolWorkflow
         }
     }
 
+    internal static IEnumerable<DependencyRule> ParseDependencyRules(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return Enumerable.Empty<DependencyRule>();
+        }
+
+        return value.Split(';')
+            .Select(pair => pair.Split('>', 2))
+            .Where(parts => parts.Length == 2
+                && !string.IsNullOrWhiteSpace(parts[0])
+                && !string.IsNullOrWhiteSpace(parts[1]))
+            .Select(parts => new DependencyRule(parts[0].Trim(), parts[1].Trim()));
+    }
+
     internal async Task<IReadOnlyList<ToolExecution>> ExecuteSequentialAsync(
         IReadOnlyList<ChatToolCall> calls,
         Func<ChatToolCall, Task<string?>> invokeAsync)

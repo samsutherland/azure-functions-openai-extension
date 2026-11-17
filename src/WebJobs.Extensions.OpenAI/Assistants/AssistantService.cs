@@ -324,7 +324,7 @@ class DefaultAssistantService : IAssistantService
         CancellationToken cancellationToken)
     {
         IList<ChatTool>? functions = this.skillInvoker.GetFunctionsDefinitions();
-        AssistantToolWorkflow workflow = new();
+        AssistantToolWorkflow workflow = new(AssistantToolWorkflow.ParseDependencyRules(attribute.ToolWorkflowDependencies));
 
         // We loop if the model returns function calls. Otherwise, we break after receiving a response.
         while (true)

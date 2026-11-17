@@ -42,4 +42,10 @@ public sealed class AssistantPostAttribute : AssistantBaseAttribute
     /// </summary>
     [AutoResolve]
     public string CollectionName { get; set; } = "ChatState";
+
+    /// <summary>
+    /// Gets or sets declared tool dependencies as a semicolon-separated list of
+    /// <c>prerequisite&gt;dependent</c> operation pairs.
+    /// </summary>
+    public string? ToolWorkflowDependencies { get; set; }
 }

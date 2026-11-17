@@ -67,6 +67,12 @@ public sealed class AssistantPostInputAttribute : InputBindingAttribute
     public string CollectionName { get; set; } = "ChatState";
 
     /// <summary>
+    /// Gets or sets declared tool dependencies as a semicolon-separated list of
+    /// <c>prerequisite&gt;dependent</c> operation pairs.
+    /// </summary>
+    public string? ToolWorkflowDependencies { get; set; }
+
+    /// <summary>
     /// Gets or sets the sampling temperature to use, between 0 and 2. Higher values like 0.8 will make the output
     /// more random, while lower values like 0.2 will make it more focused and deterministic.
     /// </summary>

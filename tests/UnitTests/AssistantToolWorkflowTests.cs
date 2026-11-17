@@ -254,6 +254,16 @@ public class AssistantToolWorkflowTests
         Assert.Equal(AssistantToolWorkflow.ToolExecutionDisposition.Invoked, Assert.Single(results).Disposition);
     }
 
+    [Fact]
+    public void DependencyRuleParser_IgnoresMalformedPairs()
+    {
+        var rules = AssistantToolWorkflow.ParseDependencyRules("GetSetup>GeneratePlan;invalid;>missing;").ToList();
+
+        var rule = Assert.Single(rules);
+        Assert.Equal("GetSetup", rule.PrerequisiteOperation);
+        Assert.Equal("GeneratePlan", rule.DependentOperation);
+    }
+
     static ChatToolCall Call(string id, string name, string arguments) =>
         ChatToolCall.CreateFunctionToolCall(id, name, BinaryData.FromString(arguments));
 }
