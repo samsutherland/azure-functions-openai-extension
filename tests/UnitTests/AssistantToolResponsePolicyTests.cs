@@ -94,6 +94,18 @@ public class AssistantToolResponsePolicyTests
         Assert.Equal(recovered ? "Your saved setup is ready." : "Old confirmation?", policy.Render());
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void ApiStringResultsAreUnwrappedBeforeRenderingVerifiedEvidence(int encodingLayers)
+    {
+        string result = """{"schemaVersion":1,"operation":"Write","success":false,"verified":true,"outcome":"needs_user_input","promptContext":"Saved goal and schedule","nextQuestion":"Does that feel right?"}""";
+        for (int i = 0; i < encodingLayers; i++)
+            result = Newtonsoft.Json.JsonConvert.SerializeObject(result);
+        Assert.Equal("Saved goal and schedule" + Environment.NewLine + Environment.NewLine + "Does that feel right?", Observe(result).Render());
+    }
+
     static AssistantToolResponsePolicy Observe(string result)
     {
         var policy = new AssistantToolResponsePolicy("Write");

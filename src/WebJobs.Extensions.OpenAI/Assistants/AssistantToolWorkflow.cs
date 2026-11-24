@@ -294,7 +294,7 @@ internal sealed class AssistantToolWorkflow
             ? MissingResultFailureResult(functionName)
             : result;
 
-    static JToken? ParseResult(string? result)
+    internal static JToken? ParseResult(string? result)
     {
         if (string.IsNullOrWhiteSpace(result))
         {

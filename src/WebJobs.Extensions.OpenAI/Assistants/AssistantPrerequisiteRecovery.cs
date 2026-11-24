@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using OpenAI.Chat;
 
@@ -87,16 +86,10 @@ internal sealed class AssistantPrerequisiteRecovery
                 || (Text(after?["outcome"]) == "needs_user_input" && after?["success"]?.Type == JTokenType.Boolean && !IsTrue(after["success"])));
     }
 
-    internal static JObject? Evidence(string operation, string? result)
-    {
-        try
-        {
-            return JToken.Parse(result ?? string.Empty) is JObject obj
-                && obj["schemaVersion"]?.Type == JTokenType.Integer && obj["schemaVersion"]!.ToString() == "1"
-                && Text(obj["operation"]) == operation ? obj : null;
-        }
-        catch (JsonException) { return null; }
-    }
+    internal static JObject? Evidence(string operation, string? result) =>
+        AssistantToolWorkflow.ParseResult(result) is JObject obj
+            && obj["schemaVersion"]?.Type == JTokenType.Integer && obj["schemaVersion"]!.ToString() == "1"
+            && Text(obj["operation"]) == operation ? obj : null;
 
     static string? Actor(JObject? obj) => obj?["actorId"]?.Type == JTokenType.Integer
         && int.TryParse(obj["actorId"]!.ToString(), out int actor) && actor > 0 ? actor.ToString(System.Globalization.CultureInfo.InvariantCulture) : null;

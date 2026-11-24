@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using OpenAI.Chat;
 
@@ -115,24 +114,13 @@ internal sealed class AssistantToolResponsePolicy
         return null;
     }
 
-    static JObject? ParseVerifiedResult(AssistantToolWorkflow.ToolExecution execution)
-    {
-        try
-        {
-            if (JToken.Parse(execution.Result ?? string.Empty) is JObject result
-                && result["schemaVersion"]?.Type == JTokenType.Integer
-                && result["schemaVersion"]?.ToString() == "1"
-                && result["operation"]?.Type == JTokenType.String
-                && result["operation"]?.Value<string>() == execution.Call.FunctionName
-                && IsTrue(result["verified"]))
-                return result;
-        }
-        catch (JsonException)
-        {
-            // Malformed evidence cannot establish readiness or completion.
-        }
-        return null;
-    }
+    static JObject? ParseVerifiedResult(AssistantToolWorkflow.ToolExecution execution) =>
+        AssistantToolWorkflow.ParseResult(execution.Result) is JObject result
+            && result["schemaVersion"]?.Type == JTokenType.Integer
+            && result["schemaVersion"]?.ToString() == "1"
+            && result["operation"]?.Type == JTokenType.String
+            && result["operation"]?.Value<string>() == execution.Call.FunctionName
+            && IsTrue(result["verified"]) ? result : null;
 
     static bool IsTrue(JToken? token) => token?.Type == JTokenType.Boolean && token.Value<bool>();
 }
