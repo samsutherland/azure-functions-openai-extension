@@ -15,8 +15,11 @@ internal sealed class AssistantToolWorkflow
     readonly HashSet<string> failedOperations = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, HashSet<string>> prerequisitesByDependent = new(StringComparer.OrdinalIgnoreCase);
 
-    internal AssistantToolWorkflow(IEnumerable<DependencyRule>? dependencyRules = null)
+    readonly AssistantPrerequisiteRecovery recovery;
+
+    internal AssistantToolWorkflow(IEnumerable<DependencyRule>? dependencyRules = null, IEnumerable<DependencyRule>? recoveryRules = null)
     {
+        this.recovery = new(recoveryRules);
         foreach (DependencyRule rule in dependencyRules ?? Enumerable.Empty<DependencyRule>())
         {
             if (string.IsNullOrWhiteSpace(rule.PrerequisiteOperation)
@@ -60,7 +63,13 @@ internal sealed class AssistantToolWorkflow
         {
             string? result;
             ToolExecutionDisposition disposition;
-            if (this.IsDuplicateFailedRequest(call))
+            bool? recoveryRead = this.recovery.Authorize(call);
+            if (recoveryRead == false)
+            {
+                result = RecoveryBlockedResult(call.FunctionName);
+                disposition = ToolExecutionDisposition.DependencyBlocked;
+            }
+            else if (recoveryRead != true && this.IsDuplicateFailedRequest(call))
             {
                 result = DuplicateFailureResult(call.FunctionName);
                 disposition = ToolExecutionDisposition.DuplicateBlocked;
@@ -81,19 +90,39 @@ internal sealed class AssistantToolWorkflow
                 disposition = ToolExecutionDisposition.Invoked;
             }
 
-            this.Record(call, result);
+            if (disposition == ToolExecutionDisposition.Invoked)
+                this.Record(call, result);
+            else
+                this.failedOperations.Add(call.FunctionName);
             failedMutationInBatch |= IsMutation(call.FunctionName) && IsFailure(result);
-            executions.Add(new ToolExecution(call, result, disposition));
+            executions.Add(new ToolExecution(call, result, disposition, recoveryRead == true));
         }
 
         return executions;
     }
+
+    internal bool IsRecoveryControlledRead(string operation) => this.recovery.Controls(operation);
 
     internal bool IsDuplicateFailedRequest(ChatToolCall call) =>
         this.failedRequests.Contains(Fingerprint(call));
 
     internal void Record(ChatToolCall call, string? result)
     {
+        this.recovery.ObserveRepair(call, result);
+        if (this.recovery.Controls(call.FunctionName))
+        {
+            if (this.recovery.ObserveRead(call, result))
+            {
+                this.failedOperations.Remove(call.FunctionName);
+                this.failedRequests.Remove(Fingerprint(call));
+            }
+            else
+            {
+                this.failedOperations.Add(call.FunctionName);
+                this.failedRequests.Add(Fingerprint(call));
+            }
+            return;
+        }
         bool unverifiedPrerequisite = this.prerequisitesByDependent.Values.Any(names => names.Contains(call.FunctionName))
             && !IsSuccessfulPrerequisite(result);
         if (IsFailure(result) || unverifiedPrerequisite)
@@ -243,6 +272,12 @@ internal sealed class AssistantToolWorkflow
             assistantInstruction = "A prior write in this batch failed, so this write was not attempted. Repair and verify the failed operation before continuing."
         });
 
+    internal static string RecoveryBlockedResult(string operation) => JsonConvert.SerializeObject(new
+    {
+        success = false, outcome = "prerequisite_recovery_blocked", operation, retryable = false,
+        assistantInstruction = "The read requires a verified repair for the same athlete and identical arguments, and can be retried only once in this turn. Do not repeat writes or claim completion."
+    });
+
     internal static string MissingResultFailureResult(string functionName) =>
         JsonConvert.SerializeObject(new
         {
@@ -319,7 +354,8 @@ internal sealed class AssistantToolWorkflow
     internal sealed record ToolExecution(
         ChatToolCall Call,
         string? Result,
-        ToolExecutionDisposition Disposition);
+        ToolExecutionDisposition Disposition,
+        bool IsRecoveryRead = false);
 
     internal sealed record DependencyRule(string PrerequisiteOperation, string DependentOperation);
 

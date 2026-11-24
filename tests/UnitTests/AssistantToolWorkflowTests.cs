@@ -264,6 +264,90 @@ public class AssistantToolWorkflowTests
         Assert.Equal("GeneratePlan", rule.DependentOperation);
     }
 
+    [Theory]
+    [InlineData(1, true, true)]
+    [InlineData(2, true, false)]
+    [InlineData(1, false, false)]
+    public async Task ConfirmedRepairAllowsOneIdenticalReadOnlyForTheSameVerifiedActor(int repairActor, bool verified, bool allowed)
+    {
+        var workflow = RecoveryWorkflow();
+        var read = Call("read", "Check", """{"userId":1}""");
+        var repair = Call("repair", "Confirm", """{"userId":1}""");
+        await workflow.ExecuteSequentialAsync([read], _ => Task.FromResult<string?>(Evidence("Check", 1, false, "needs_user_input")));
+        var blockedPlan = await workflow.ExecuteSequentialAsync([Call("blocked-plan", "Plan", "{}")], _ => throw new Exception("Prerequisite not ready"));
+        Assert.Equal(AssistantToolWorkflow.ToolExecutionDisposition.DependencyBlocked, blockedPlan[0].Disposition);
+        await workflow.ExecuteSequentialAsync([repair], _ => Task.FromResult<string?>(Evidence("Confirm", repairActor, true, "confirmed", verified)));
+        var invoked = 0;
+        var retried = await workflow.ExecuteSequentialAsync([read], _ =>
+        {
+            invoked++;
+            return Task.FromResult<string?>(Evidence("Check", 1, true, "ready"));
+        });
+        Assert.Equal(allowed ? 1 : 0, invoked);
+        if (allowed)
+        {
+            Assert.Contains("ready", retried[0].Result);
+            var plan = await workflow.ExecuteSequentialAsync([Call("plan", "Plan", "{}")], _ => Task.FromResult<string?>("{}"));
+            Assert.Equal(AssistantToolWorkflow.ToolExecutionDisposition.Invoked, plan[0].Disposition);
+        }
+    }
+
+    [Fact]
+    public async Task FailedRecoveryCannotResetItsBudgetOrUnlockUnknownWrites()
+    {
+        var workflow = RecoveryWorkflow();
+        var read = Call("read", "Check", """{"userId":1}""");
+        var repair = Call("repair", "Confirm", """{"userId":1}""");
+        await workflow.ExecuteSequentialAsync([read], _ => Task.FromResult<string?>(Evidence("Check", 1, false, "failed")));
+        await workflow.ExecuteSequentialAsync([repair], _ => Task.FromResult<string?>(Evidence("Confirm", 1, true, "confirmed")));
+        var count = 0;
+        for (var i = 0; i < 3; i++)
+        {
+            await workflow.ExecuteSequentialAsync([read], _ => { count++; return Task.FromResult<string?>(Evidence("Check", 1, false, "failed")); });
+            await workflow.ExecuteSequentialAsync([repair], _ => Task.FromResult<string?>(Evidence("Confirm", 1, true, "confirmed")));
+        }
+        Assert.Equal(1, count);
+        var write = Call("write", "SetValue", "{}");
+        await workflow.ExecuteSequentialAsync([write], _ => Task.FromResult<string?>("""{"success":false,"outcome":"unknown"}"""));
+        await workflow.ExecuteSequentialAsync([write], _ => throw new Exception("Unknown write must not repeat"));
+    }
+
+    [Fact]
+    public async Task RecoveryCannotChangeArgumentsOrBeUnlockedByAnUnrelatedRepair()
+    {
+        var workflow = RecoveryWorkflow();
+        var read = Call("read", "Check", """{"userId":1}""");
+        await workflow.ExecuteSequentialAsync([read], _ => Task.FromResult<string?>(Evidence("Check", 1, false, "needs_user_input")));
+        await workflow.ExecuteSequentialAsync([Call("unrelated", "Other", "{}")], _ => Task.FromResult<string?>(Evidence("Other", 1, true, "confirmed")));
+        var blocked = await workflow.ExecuteSequentialAsync([read], _ => throw new Exception("Unrelated repair must not unlock the read"));
+        Assert.Equal(AssistantToolWorkflow.ToolExecutionDisposition.DependencyBlocked, blocked[0].Disposition);
+        await workflow.ExecuteSequentialAsync([Call("repair", "Confirm", "{}")], _ => Task.FromResult<string?>(Evidence("Confirm", 1, true, "confirmed")));
+        await workflow.ExecuteSequentialAsync([Call("changed", "Check", """{"userId":2}""")], _ => throw new Exception("Actor arguments must not change"));
+        var recovered = await workflow.ExecuteSequentialAsync([read], _ => Task.FromResult<string?>(Evidence("Check", 1, true, "ready")));
+        Assert.True(recovered[0].IsRecoveryRead);
+    }
+
+    [Theory]
+    [InlineData("{}")]
+    [InlineData("{\"schemaVersion\":1,\"operation\":\"Check\",\"success\":false,\"outcome\":\"failed\"}")]
+    [InlineData("{\"schemaVersion\":1,\"operation\":\"Check\",\"actorId\":\"1\",\"success\":false,\"outcome\":\"failed\"}")]
+    public async Task RecoveryRequiresCanonicalActorEvidenceFromTheOriginalRead(string failedRead)
+    {
+        var workflow = RecoveryWorkflow();
+        var read = Call("read", "Check", """{"userId":1}""");
+        await workflow.ExecuteSequentialAsync([read], _ => Task.FromResult<string?>(failedRead));
+        await workflow.ExecuteSequentialAsync([Call("repair", "Confirm", "{}")], _ => Task.FromResult<string?>(Evidence("Confirm", 1, true, "confirmed")));
+        await workflow.ExecuteSequentialAsync([read], _ => throw new Exception("Unscoped read must not gain recovery credit"));
+    }
+
+    static AssistantToolWorkflow RecoveryWorkflow() => new(
+        AssistantToolWorkflow.ParseDependencyRules("Check>Plan"),
+        AssistantToolWorkflow.ParseDependencyRules("Check>Confirm"));
+
+    static string Evidence(string operation, int actor, bool success, string outcome, bool verified = true) =>
+        Newtonsoft.Json.JsonConvert.SerializeObject(new { schemaVersion = 1, operation, actorId = actor,
+            success, outcome, verified, persisted = success && operation != "Check", ready = success && operation == "Check" });
+
     static ChatToolCall Call(string id, string name, string arguments) =>
         ChatToolCall.CreateFunctionToolCall(id, name, BinaryData.FromString(arguments));
 }
