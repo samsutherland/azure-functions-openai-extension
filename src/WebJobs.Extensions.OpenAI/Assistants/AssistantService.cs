@@ -324,7 +324,8 @@ class DefaultAssistantService : IAssistantService
         CancellationToken cancellationToken)
     {
         IList<ChatTool>? functions = this.skillInvoker.GetFunctionsDefinitions();
-        AssistantToolWorkflow workflow = new(AssistantToolWorkflow.ParseDependencyRules(attribute.ToolWorkflowDependencies));
+        AssistantToolWorkflow workflow = new(AssistantToolWorkflow.ParseDependencyRules(attribute.ToolWorkflowDependencies),
+            AssistantToolWorkflow.ParseDependencyRules(attribute.ToolWorkflowRecoveryReads));
         AssistantToolResponsePolicy responsePolicy = new(attribute.ToolResponseOperations, attribute.ToolResponsePrerequisites);
         int turnStart = chatState.Messages.Count;
 
@@ -791,7 +792,7 @@ class DefaultAssistantService : IAssistantService
             else if (execution.Disposition == AssistantToolWorkflow.ToolExecutionDisposition.DependencyBlocked)
             {
                 this.logger.LogWarning(
-                    "[{Id}] Blocked dependent mutation function={Name} after an earlier mutation failed",
+                    "[{Id}] Blocked tool function={Name} under workflow dependency or recovery policy",
                     assistantId,
                     execution.Call.FunctionName);
             }
@@ -820,6 +821,7 @@ class DefaultAssistantService : IAssistantService
 
         string? functionResult = await this.InvokeFunctionWithErrorHandling(assistantId, call, cancellationToken);
         if (AssistantToolWorkflow.IsFailure(functionResult)
+            && !workflow.IsRecoveryControlledRead(call.FunctionName)
             && AssistantToolWorkflow.TryCreateSafeCorrection(call, functionResult, out ChatToolCall? correctedCall))
         {
             this.logger.LogInformation(

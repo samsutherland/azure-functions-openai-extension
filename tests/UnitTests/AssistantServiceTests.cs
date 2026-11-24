@@ -19,7 +19,7 @@ using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Extensions.OpenAI.Tests.Assistants;
 
-public class DefaultAssistantServiceTests
+public partial class DefaultAssistantServiceTests
 {
     readonly Mock<OpenAIClientFactory> mockOpenAIClientFactory;
     readonly Mock<AzureComponentFactory> mockAzureComponentFactory;

@@ -73,6 +73,14 @@ public sealed class AssistantPostInputAttribute : InputBindingAttribute
     public string? ToolWorkflowDependencies { get; set; }
 
     /// <summary>
+    /// Semicolon-separated read&gt;repair pairs. A verified, persisted confirmation
+    /// for the same actor permits one identical read retry per processing invocation.
+    /// Configure only read operations; unknown writes are never retried by this rule.
+    /// </summary>
+    public string? ToolWorkflowRecoveryReads { get; set; }
+
+
+    /// <summary>
     /// Gets or sets the semicolon-separated tool names whose turns use verified
     /// result responses instead of model text. Null preserves normal chat rendering.
     /// Only version 1 operation outcomes can establish completion.
