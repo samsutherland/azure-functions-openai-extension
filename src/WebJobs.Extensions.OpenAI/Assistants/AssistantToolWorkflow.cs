@@ -94,7 +94,9 @@ internal sealed class AssistantToolWorkflow
 
     internal void Record(ChatToolCall call, string? result)
     {
-        if (IsFailure(result))
+        bool unverifiedPrerequisite = this.prerequisitesByDependent.Values.Any(names => names.Contains(call.FunctionName))
+            && !IsSuccessfulPrerequisite(result);
+        if (IsFailure(result) || unverifiedPrerequisite)
         {
             this.failedRequests.Add(Fingerprint(call));
             this.failedOperations.Add(call.FunctionName);
@@ -102,6 +104,26 @@ internal sealed class AssistantToolWorkflow
         }
 
         this.failedOperations.Remove(call.FunctionName);
+    }
+
+    static bool IsSuccessfulPrerequisite(string? result)
+    {
+        if (ParseResult(result) is not JObject obj
+            || obj.GetValue("success", StringComparison.OrdinalIgnoreCase) is not JValue { Type: JTokenType.Boolean } success
+            || !success.Value<bool>())
+        {
+            return false;
+        }
+        JToken? verified = obj.GetValue("verified", StringComparison.OrdinalIgnoreCase);
+        if (verified is not null && (verified.Type != JTokenType.Boolean || !verified.Value<bool>()))
+        {
+            return false;
+        }
+        JToken? outcome = obj.GetValue("outcome", StringComparison.OrdinalIgnoreCase);
+        // Legacy explicit-success results remain compatible. When supplied, the
+        // outcome must name a known successful transition, never unknown evidence.
+        return outcome is null || (outcome.Type == JTokenType.String
+            && outcome.Value<string>() is "ready" or "saved" or "confirmed" or "success" or "completed");
     }
 
     bool HasFailedPrerequisite(string? functionName) =>

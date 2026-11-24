@@ -48,4 +48,12 @@ public sealed class AssistantPostAttribute : AssistantBaseAttribute
     /// <c>prerequisite&gt;dependent</c> operation pairs.
     /// </summary>
     public string? ToolWorkflowDependencies { get; set; }
+
+    /// <summary>
+    /// Gets or sets the semicolon-separated tool names whose turns use verified
+    /// result responses instead of model text. Null preserves normal chat rendering.
+    /// Only version 1 operation outcomes can establish completion.
+    /// </summary>
+    public string? ToolResponseOperations { get; set; }
+
 }

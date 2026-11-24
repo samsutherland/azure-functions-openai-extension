@@ -891,6 +891,95 @@ public class DefaultAssistantServiceTests
         Assert.Equal(messages.Count, trimmedMessages.Count);
     }
 
+    [Theory]
+    [InlineData("{\"success\":false,\"outcome\":\"failed\"}", 1)]
+    [InlineData("", 1)]
+    [InlineData("not-json", 1)]
+    [InlineData("{\"success\":true,\"outcome\":\"unknown\"}", 1)]
+    [InlineData("", 60)]
+    [InlineData("", 1, false)]
+    public async Task PostMessageAsync_EvidencePolicySuppressesFalseClaimsInStoredAndReturnedMessages(string setupResult, int toolCount, bool enabled = true)
+    {
+        const string assistantId = "evidence-test";
+        var attribute = new AssistantPostAttribute(assistantId, "Build my plan")
+        {
+            ToolWorkflowDependencies = "GetTrainingSetupStatusSkill>GenerateWeeklyPlanSkill"
+        };
+        // Reflection keeps this reproduction runnable against the old binding contract.
+        if (enabled)
+        {
+            typeof(AssistantPostAttribute).GetProperty("ToolResponseOperations")?.SetValue(
+                attribute, "GetTrainingSetupStatusSkill;GenerateWeeklyPlanSkill");
+        }
+        var setup = ChatToolCall.CreateFunctionToolCall("setup", "GetTrainingSetupStatusSkill", BinaryData.FromString("{}"));
+        var plan = ChatToolCall.CreateFunctionToolCall("plan", "GenerateWeeklyPlanSkill", BinaryData.FromString("{}"));
+        var chatClient = new Mock<ChatClient>();
+        var completions = new Queue<ChatCompletion>(new[]
+        {
+            // This prose precedes the first sensitive call and must also disappear.
+            Completion("Your plan is saved and synced.", ChatToolCall.CreateFunctionToolCall(
+                "read", "GetActivity", BinaryData.FromString("{}"))),
+            Completion("Your plan is saved and synced.", Enumerable.Range(0, toolCount)
+                .Select(i => ChatToolCall.CreateFunctionToolCall($"setup-{i}", setup.FunctionName, setup.FunctionArguments)).ToArray()),
+            Completion("Everything is saved on your watch.", plan),
+            Completion("Your plan was saved and synced successfully.")
+        });
+        chatClient.Setup(c => c.CompleteChatAsync(
+                It.IsAny<IEnumerable<ChatMessage>>(), It.IsAny<ChatCompletionOptions>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(() => ClientResult.FromValue(completions.Dequeue(), new Mock<System.ClientModel.Primitives.PipelineResponse>().Object));
+        var factory = this.mockOpenAIClientFactory.Object;
+        var cache = (System.Collections.Concurrent.ConcurrentDictionary<string, (ChatClient, string, string)>)
+            typeof(OpenAIClientFactory).GetField("chatClients", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(factory)!;
+        cache[""] = (chatClient.Object, "synthetic", "synthetic");
+        cache["OpenAI"] = (chatClient.Object, "synthetic", "synthetic");
+        this.mockSkillInvoker.Setup(i => i.InvokeAsync(It.IsAny<ChatToolCall>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(setupResult);
+        var stored = new List<ChatMessageTableEntity>();
+        this.mockTableClient.Setup(t => t.QueryAsync<TableEntity>(It.IsAny<string>(), null, null, It.IsAny<CancellationToken>()))
+            .Returns(MockAsyncPageable<TableEntity>.Create(new[]
+            {
+                new TableEntity(assistantId, AssistantStateEntity.FixedRowKeyValue)
+                {
+                    ["Exists"] = true, ["CreatedAt"] = DateTime.UtcNow.AddDays(-1),
+                    ["LastUpdatedAt"] = DateTime.UtcNow.AddDays(-1), ["TotalMessages"] = 0, ["TotalTokens"] = 0
+                }
+            }));
+        this.mockTableClient.Setup(t => t.SubmitTransactionAsync(It.IsAny<IEnumerable<TableTransactionAction>>(), It.IsAny<CancellationToken>()))
+            .Callback<IEnumerable<TableTransactionAction>, CancellationToken>((actions, _) =>
+                stored.AddRange(actions.Select(a => a.Entity).OfType<ChatMessageTableEntity>()))
+            .ReturnsAsync(Response.FromValue<IReadOnlyList<Response>>(Array.Empty<Response>(), new Mock<Response>().Object));
+        var service = new DefaultAssistantService(factory, this.mockAzureComponentFactory.Object,
+            this.mockConfiguration.Object, this.mockSkillInvoker.Object, this.mockLoggerFactory.Object);
+        typeof(DefaultAssistantService).GetField("tableClient", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(service, this.mockTableClient.Object);
+
+        var state = await service.PostMessageAsync(attribute, CancellationToken.None);
+
+        if (!enabled)
+        {
+            Assert.Contains(state.RecentMessages, m => m.Content.Contains("saved and synced", StringComparison.Ordinal));
+            return;
+        }
+        Assert.All(state.RecentMessages, m => Assert.DoesNotContain("saved and synced", m.Content));
+        Assert.All(stored.Where(m => m.Role == "Assistant"), m =>
+        {
+            Assert.DoesNotContain("saved and synced", m.Content);
+            Assert.DoesNotContain("saved on your watch", m.Content);
+        });
+        Assert.Contains(state.RecentMessages, m => m.Content.Contains("couldn't verify", StringComparison.Ordinal));
+        this.mockSkillInvoker.Verify(i => i.InvokeAsync(
+            It.Is<ChatToolCall>(call => call.FunctionName == "GenerateWeeklyPlanSkill"), It.IsAny<CancellationToken>()), Times.Never);
+        var calls = stored.SelectMany(m => m.ToolCalls ?? Array.Empty<ChatToolCall>()).ToList();
+        var results = stored.Where(m => m.Role == "Tool").ToList();
+        Assert.Equal(calls.Select(c => c.Id), results.Select(m => m.Name));
+    }
+
+    static ChatCompletion Completion(string text, params ChatToolCall[] calls) =>
+        OpenAIChatModelFactory.ChatCompletion(
+            id: "synthetic", finishReason: calls.Length == 0 ? ChatFinishReason.Stop : ChatFinishReason.ToolCalls,
+            content: new ChatMessageContent(text), toolCalls: calls,
+            usage: OpenAIChatModelFactory.ChatTokenUsage(1, 1, 2));
+
     static Mock<IConfigurationSection> CreateMockSection(bool exists, string? tableServiceUri = null)
     {
         var mockSection = new Mock<IConfigurationSection>();

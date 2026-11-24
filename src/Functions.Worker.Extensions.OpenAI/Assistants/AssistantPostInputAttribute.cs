@@ -73,6 +73,14 @@ public sealed class AssistantPostInputAttribute : InputBindingAttribute
     public string? ToolWorkflowDependencies { get; set; }
 
     /// <summary>
+    /// Gets or sets the semicolon-separated tool names whose turns use verified
+    /// result responses instead of model text. Null preserves normal chat rendering.
+    /// Only version 1 operation outcomes can establish completion.
+    /// </summary>
+    public string? ToolResponseOperations { get; set; }
+
+
+    /// <summary>
     /// Gets or sets the sampling temperature to use, between 0 and 2. Higher values like 0.8 will make the output
     /// more random, while lower values like 0.2 will make it more focused and deterministic.
     /// </summary>

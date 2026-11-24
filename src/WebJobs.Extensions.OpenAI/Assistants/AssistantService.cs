@@ -325,6 +325,8 @@ class DefaultAssistantService : IAssistantService
     {
         IList<ChatTool>? functions = this.skillInvoker.GetFunctionsDefinitions();
         AssistantToolWorkflow workflow = new(AssistantToolWorkflow.ParseDependencyRules(attribute.ToolWorkflowDependencies));
+        AssistantToolResponsePolicy responsePolicy = new(attribute.ToolResponseOperations);
+        int turnStart = chatState.Messages.Count;
 
         // We loop if the model returns function calls. Otherwise, we break after receiving a response.
         while (true)
@@ -332,33 +334,45 @@ class DefaultAssistantService : IAssistantService
             // Get the LLM response
             ClientResult<ChatCompletion> response = await this.GetLLMResponse(attribute, chatState, functions, cancellationToken);
 
-            // Process text response if available
-            string replyMessage = this.FormatReplyMessage(response);
-            if (!string.IsNullOrWhiteSpace(replyMessage) || response.Value.ToolCalls.Any())
+            List<ChatToolCall> functionCalls = response.Value.ToolCalls.ToList();
+            responsePolicy.ObserveCalls(functionCalls);
+            if (responsePolicy.IsActive)
+            {
+                // These entities share references with the pending storage transaction.
+                // Clear earlier model prose in this turn before anything is committed.
+                foreach (ChatMessageTableEntity message in chatState.Messages.Skip(turnStart)
+                    .Where(message => message.Role == ChatMessageRole.Assistant.ToString()))
+                {
+                    message.Content = string.Empty;
+                }
+            }
+
+            chatState.Metadata.TotalTokens = response.Value.Usage.TotalTokenCount;
+            // Reserve room for every tool result and a final reply. Never persist
+            // tool calls that will not have corresponding results.
+            if (functionCalls.Count > 0 && batch.Count + functionCalls.Count + 3 > FunctionCallBatchLimit)
+            {
+                this.LogBatchLimitExceeded(attribute.Id, functionCalls.Count);
+                this.LogAndAddAssistantReply(attribute.Id,
+                    AssistantToolResponsePolicy.UnverifiedResponse, response, chatState, batch, includeToolCalls: false);
+                break;
+            }
+
+            string replyMessage = responsePolicy.IsActive
+                ? functionCalls.Count == 0 ? responsePolicy.Render() : string.Empty
+                : this.FormatReplyMessage(response);
+            if (!string.IsNullOrWhiteSpace(replyMessage) || functionCalls.Count > 0)
             {
                 this.LogAndAddAssistantReply(attribute.Id, replyMessage, response, chatState, batch);
             }
-
-            // Update token count
-            chatState.Metadata.TotalTokens = response.Value.Usage.TotalTokenCount;
-
-            // Handle function calls
-            List<ChatToolCall> functionCalls = response.Value.ToolCalls.OfType<ChatToolCall>().ToList();
             if (functionCalls.Count == 0)
             {
-                // No function calls, so we're done
                 break;
             }
 
-            if (batch.Count > FunctionCallBatchLimit)
-            {
-                // Too many function calls, something might be wrong
-                this.LogBatchLimitExceeded(attribute.Id, functionCalls.Count);
-                break;
-            }
-
-            // Process function calls
-            await this.ProcessFunctionCalls(attribute.Id, functionCalls, chatState, batch, workflow, cancellationToken);
+            IReadOnlyList<AssistantToolWorkflow.ToolExecution> executions = await this.ProcessFunctionCalls(
+                attribute.Id, functionCalls, chatState, batch, workflow, cancellationToken);
+            responsePolicy.ObserveResults(executions);
         }
     }
 
@@ -702,7 +716,8 @@ class DefaultAssistantService : IAssistantService
         string replyMessage,
         ClientResult<ChatCompletion> response,
         InternalChatState chatState,
-        List<TableTransactionAction> batch)
+        List<TableTransactionAction> batch,
+        bool includeToolCalls = true)
     {
         this.logger.LogInformation(
             "[{Id}] Got LLM response consisting of {Count} tokens: [{Text}] && {Count} ToolCalls",
@@ -716,7 +731,7 @@ class DefaultAssistantService : IAssistantService
             messageIndex: ++chatState.Metadata.TotalMessages,
             content: EncodeContentForTableStorage(replyMessage),
             role: ChatMessageRole.Assistant,
-            toolCalls: response.Value.ToolCalls);
+            toolCalls: includeToolCalls ? response.Value.ToolCalls : null);
 
         chatState.Messages.Add(replyFromAssistantEntity);
         batch.Add(new TableTransactionAction(TableTransactionActionType.Add, replyFromAssistantEntity));
@@ -736,7 +751,7 @@ class DefaultAssistantService : IAssistantService
             FunctionCallBatchLimit);
     }
 
-    async Task ProcessFunctionCalls(
+    async Task<IReadOnlyList<AssistantToolWorkflow.ToolExecution>> ProcessFunctionCalls(
         string assistantId,
         List<ChatToolCall> functionCalls,
         InternalChatState chatState,
@@ -783,6 +798,7 @@ class DefaultAssistantService : IAssistantService
                 chatState,
                 batch);
         }
+        return executions;
     }
 
     async Task<string?> InvokeFunctionWithSafeCorrection(
