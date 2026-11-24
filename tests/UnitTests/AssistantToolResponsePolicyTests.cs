@@ -52,6 +52,33 @@ public class AssistantToolResponsePolicyTests
         Assert.False(policy.IsActive);
     }
 
+    [Theory]
+    [InlineData("{\"schemaVersion\":1,\"operation\":\"CheckSetup\",\"success\":true,\"verified\":true,\"outcome\":\"ready\",\"ready\":true}", false)]
+    [InlineData("{\"schemaVersion\":1,\"operation\":\"CheckSetup\",\"success\":false,\"verified\":true,\"outcome\":\"needs_user_input\",\"nextQuestion\":\"Goal: climb confidently. Monday: 0 hours. Does that feel right?\"}", true)]
+    [InlineData("{\"success\":false,\"outcome\":\"failed\"}", true)]
+    [InlineData("not-json", true)]
+    [InlineData("{\"schemaVersion\":1,\"operation\":\"Other\",\"success\":true,\"verified\":true,\"outcome\":\"ready\",\"ready\":true}", true)]
+    public void PrerequisiteBoundaryOwnsOnlyIncompleteOrUnverifiedReads(string result, bool active)
+    {
+        var policy = new AssistantToolResponsePolicy(null, "CheckSetup");
+        var call = ChatToolCall.CreateFunctionToolCall("check", "CheckSetup", BinaryData.FromString("{}"));
+        policy.ObserveCalls([call]);
+        Assert.False(policy.IsActive);
+        policy.ObserveResults([new(call, result, AssistantToolWorkflow.ToolExecutionDisposition.Invoked)]);
+        Assert.Equal(active, policy.IsActive);
+        if (result.Contains("needs_user_input", StringComparison.Ordinal))
+        {
+            Assert.Equal("Goal: climb confidently. Monday: 0 hours. Does that feel right?", policy.Render());
+        }
+    }
+
+    [Fact]
+    public void MissingInputRendersSavedContextBeforeTheUnchangedQuestion()
+    {
+        var policy = Observe("""{"schemaVersion":1,"operation":"Write","success":false,"verified":true,"outcome":"needs_user_input","promptContext":"Goal: climb confidently.\nMonday: 0 hours.","nextQuestion":"Does that feel right?"}""");
+        Assert.Equal("Goal: climb confidently.\nMonday: 0 hours." + Environment.NewLine + Environment.NewLine + "Does that feel right?", policy.Render());
+    }
+
     static AssistantToolResponsePolicy Observe(string result)
     {
         var policy = new AssistantToolResponsePolicy("Write");

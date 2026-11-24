@@ -325,8 +325,16 @@ class DefaultAssistantService : IAssistantService
     {
         IList<ChatTool>? functions = this.skillInvoker.GetFunctionsDefinitions();
         AssistantToolWorkflow workflow = new(AssistantToolWorkflow.ParseDependencyRules(attribute.ToolWorkflowDependencies));
-        AssistantToolResponsePolicy responsePolicy = new(attribute.ToolResponseOperations);
+        AssistantToolResponsePolicy responsePolicy = new(attribute.ToolResponseOperations, attribute.ToolResponsePrerequisites);
         int turnStart = chatState.Messages.Count;
+
+        void ClearTurnModelProse()
+        {
+            // These entities share references with the pending storage transaction.
+            foreach (ChatMessageTableEntity message in chatState.Messages.Skip(turnStart)
+                .Where(message => message.Role == ChatMessageRole.Assistant.ToString()))
+                message.Content = string.Empty;
+        }
 
         // We loop if the model returns function calls. Otherwise, we break after receiving a response.
         while (true)
@@ -337,21 +345,16 @@ class DefaultAssistantService : IAssistantService
             List<ChatToolCall> functionCalls = response.Value.ToolCalls.ToList();
             responsePolicy.ObserveCalls(functionCalls);
             if (responsePolicy.IsActive)
-            {
-                // These entities share references with the pending storage transaction.
-                // Clear earlier model prose in this turn before anything is committed.
-                foreach (ChatMessageTableEntity message in chatState.Messages.Skip(turnStart)
-                    .Where(message => message.Role == ChatMessageRole.Assistant.ToString()))
-                {
-                    message.Content = string.Empty;
-                }
-            }
+                ClearTurnModelProse();
 
             chatState.Metadata.TotalTokens = response.Value.Usage.TotalTokenCount;
             // Reserve room for every tool result and a final reply. Never persist
             // tool calls that will not have corresponding results.
             if (functionCalls.Count > 0 && batch.Count + functionCalls.Count + 3 > FunctionCallBatchLimit)
             {
+                responsePolicy.ObserveUnexecutedCalls(functionCalls);
+                if (responsePolicy.IsActive)
+                    ClearTurnModelProse();
                 this.LogBatchLimitExceeded(attribute.Id, functionCalls.Count);
                 this.LogAndAddAssistantReply(attribute.Id,
                     AssistantToolResponsePolicy.UnverifiedResponse, response, chatState, batch, includeToolCalls: false);
@@ -373,6 +376,8 @@ class DefaultAssistantService : IAssistantService
             IReadOnlyList<AssistantToolWorkflow.ToolExecution> executions = await this.ProcessFunctionCalls(
                 attribute.Id, functionCalls, chatState, batch, workflow, cancellationToken);
             responsePolicy.ObserveResults(executions);
+            if (responsePolicy.IsActive)
+                ClearTurnModelProse();
         }
     }
 

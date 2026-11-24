@@ -14,21 +14,45 @@ internal sealed class AssistantToolResponsePolicy
 {
     internal const string UnverifiedResponse = "I couldn't verify all requested operations. Check the saved state before trying again; completion and device delivery are not confirmed.";
     readonly HashSet<string> operations;
+    readonly HashSet<string> prerequisites;
     readonly List<AssistantToolWorkflow.ToolExecution> results = new();
 
-    internal AssistantToolResponsePolicy(string? operationNames)
+    internal AssistantToolResponsePolicy(string? operationNames, string? prerequisiteNames = null)
     {
-        this.operations = new HashSet<string>((operationNames ?? string.Empty).Split(';')
-            .Select(name => name.Trim()).Where(name => name.Length > 0), StringComparer.OrdinalIgnoreCase);
+        this.operations = ParseNames(operationNames);
+        this.prerequisites = ParseNames(prerequisiteNames);
     }
+
+    static HashSet<string> ParseNames(string? names) => new((names ?? string.Empty).Split(';')
+        .Select(name => name.Trim()).Where(name => name.Length > 0), StringComparer.OrdinalIgnoreCase);
 
     internal bool IsActive { get; private set; }
 
     internal void ObserveCalls(IEnumerable<ChatToolCall> calls) =>
         this.IsActive |= calls.Any(call => this.operations.Contains(call.FunctionName));
 
-    internal void ObserveResults(IEnumerable<AssistantToolWorkflow.ToolExecution> executions) =>
-        this.results.AddRange(executions.Where(execution => this.operations.Contains(execution.Call.FunctionName)));
+    internal void ObserveUnexecutedCalls(IEnumerable<ChatToolCall> calls) =>
+        this.IsActive |= calls.Any(call => this.operations.Contains(call.FunctionName)
+            || this.prerequisites.Contains(call.FunctionName));
+
+    internal void ObserveResults(IEnumerable<AssistantToolWorkflow.ToolExecution> executions)
+    {
+        foreach (AssistantToolWorkflow.ToolExecution execution in executions)
+        {
+            bool blockedPrerequisite = this.prerequisites.Contains(execution.Call.FunctionName)
+                && !IsVerifiedReady(execution);
+            this.IsActive |= blockedPrerequisite;
+            if (blockedPrerequisite || this.operations.Contains(execution.Call.FunctionName))
+                this.results.Add(execution);
+        }
+    }
+
+    static bool IsVerifiedReady(AssistantToolWorkflow.ToolExecution execution)
+    {
+        JObject? result = ParseVerifiedResult(execution);
+        return result is not null && IsTrue(result["success"]) && IsTrue(result["ready"])
+            && result["outcome"]?.Type == JTokenType.String && result["outcome"]!.Value<string>() == "ready";
+    }
 
     internal string Render()
     {
@@ -54,39 +78,53 @@ internal sealed class AssistantToolResponsePolicy
 
     static string? RenderResult(AssistantToolWorkflow.ToolExecution execution)
     {
+        JObject? result = ParseVerifiedResult(execution);
+        if (result is null)
+            return null;
+        bool success = result["success"]?.Type == JTokenType.Boolean && result["success"]!.Value<bool>();
+        string? outcome = result["outcome"]?.Type == JTokenType.String ? result["outcome"]!.Value<string>() : null;
+        if (success && outcome == "ready")
+        {
+            return "Your saved setup is ready.";
+        }
+        if (success && outcome == "saved"
+            && IsTrue(result["persisted"]) && IsTrue(result["canTellAthleteSaved"]))
+        {
+            return "Your change was saved and verified in the app. Device delivery is not confirmed.";
+        }
+        // Missing input is an application-owned question, not a completion claim.
+        if (!success && outcome == "needs_user_input" && result["nextQuestion"]?.Type == JTokenType.String)
+        {
+            string? question = result["nextQuestion"]!.Value<string>();
+            if (string.IsNullOrWhiteSpace(question))
+                return null;
+            JToken? context = result["promptContext"];
+            if (context is null || context.Type == JTokenType.Null)
+                return question;
+            if (context.Type != JTokenType.String)
+                return null;
+            string? savedContext = context.Value<string>();
+            return string.IsNullOrWhiteSpace(savedContext) ? question
+                : savedContext + Environment.NewLine + Environment.NewLine + question;
+        }
+        return null;
+    }
+
+    static JObject? ParseVerifiedResult(AssistantToolWorkflow.ToolExecution execution)
+    {
         try
         {
-            if (JToken.Parse(execution.Result ?? string.Empty) is not JObject result
-                || result["schemaVersion"]?.Type != JTokenType.Integer
-                || result["schemaVersion"]?.ToString() != "1"
-                || result["operation"]?.Type != JTokenType.String
-                || result["operation"]?.Value<string>() != execution.Call.FunctionName
-                || result["verified"]?.Type != JTokenType.Boolean
-                || result["verified"]?.Value<bool>() != true)
-            {
-                return null;
-            }
-
-            bool success = result["success"]?.Type == JTokenType.Boolean && result["success"]!.Value<bool>();
-            string? outcome = result["outcome"]?.Type == JTokenType.String ? result["outcome"]!.Value<string>() : null;
-            if (success && outcome == "ready")
-            {
-                return "Your saved setup is ready.";
-            }
-            if (success && outcome == "saved"
-                && IsTrue(result["persisted"]) && IsTrue(result["canTellAthleteSaved"]))
-            {
-                return "Your change was saved and verified in the app. Device delivery is not confirmed.";
-            }
-            // Missing input is an application-owned question, not a completion claim.
-            if (!success && outcome == "needs_user_input" && result["nextQuestion"]?.Type == JTokenType.String)
-            {
-                return result["nextQuestion"]!.Value<string>();
-            }
+            if (JToken.Parse(execution.Result ?? string.Empty) is JObject result
+                && result["schemaVersion"]?.Type == JTokenType.Integer
+                && result["schemaVersion"]?.ToString() == "1"
+                && result["operation"]?.Type == JTokenType.String
+                && result["operation"]?.Value<string>() == execution.Call.FunctionName
+                && IsTrue(result["verified"]))
+                return result;
         }
         catch (JsonException)
         {
-            // Malformed or unsupported evidence never establishes completion.
+            // Malformed evidence cannot establish readiness or completion.
         }
         return null;
     }

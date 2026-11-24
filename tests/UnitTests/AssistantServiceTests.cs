@@ -898,7 +898,12 @@ public class DefaultAssistantServiceTests
     [InlineData("{\"success\":true,\"outcome\":\"unknown\"}", 1)]
     [InlineData("", 60)]
     [InlineData("", 1, false)]
-    public async Task PostMessageAsync_EvidencePolicySuppressesFalseClaimsInStoredAndReturnedMessages(string setupResult, int toolCount, bool enabled = true)
+    [InlineData("", 60, true, true)]
+    [InlineData("{\"success\":false,\"outcome\":\"failed\"}", 1, true, true)]
+    [InlineData("{\"schemaVersion\":1,\"operation\":\"GetTrainingSetupStatusSkill\",\"success\":false,\"verified\":true,\"outcome\":\"needs_user_input\",\"promptContext\":\"Goal: climb confidently. Monday: 0 hours.\",\"nextQuestion\":\"Does that feel right?\"}", 1, true, true, "Goal: climb confidently. Monday: 0 hours.\n\nDoes that feel right?")]
+    [InlineData("{\"schemaVersion\":1,\"operation\":\"GetTrainingSetupStatusSkill\",\"success\":true,\"verified\":true,\"outcome\":\"ready\",\"ready\":true}", 1, true, true, "Here is your saved-week summary.")]
+    public async Task PostMessageAsync_EvidencePolicySuppressesFalseClaimsInStoredAndReturnedMessages(
+        string setupResult, int toolCount, bool enabled = true, bool prerequisiteOnly = false, string? expectedReply = null)
     {
         const string assistantId = "evidence-test";
         var attribute = new AssistantPostAttribute(assistantId, "Build my plan")
@@ -908,8 +913,8 @@ public class DefaultAssistantServiceTests
         // Reflection keeps this reproduction runnable against the old binding contract.
         if (enabled)
         {
-            typeof(AssistantPostAttribute).GetProperty("ToolResponseOperations")?.SetValue(
-                attribute, "GetTrainingSetupStatusSkill;GenerateWeeklyPlanSkill");
+            typeof(AssistantPostAttribute).GetProperty(prerequisiteOnly ? "ToolResponsePrerequisites" : "ToolResponseOperations")?.SetValue(
+                attribute, prerequisiteOnly ? "GetTrainingSetupStatusSkill" : "GetTrainingSetupStatusSkill;GenerateWeeklyPlanSkill");
         }
         var setup = ChatToolCall.CreateFunctionToolCall("setup", "GetTrainingSetupStatusSkill", BinaryData.FromString("{}"));
         var plan = ChatToolCall.CreateFunctionToolCall("plan", "GenerateWeeklyPlanSkill", BinaryData.FromString("{}"));
@@ -922,7 +927,7 @@ public class DefaultAssistantServiceTests
             Completion("Your plan is saved and synced.", Enumerable.Range(0, toolCount)
                 .Select(i => ChatToolCall.CreateFunctionToolCall($"setup-{i}", setup.FunctionName, setup.FunctionArguments)).ToArray()),
             Completion("Everything is saved on your watch.", plan),
-            Completion("Your plan was saved and synced successfully.")
+            Completion(expectedReply == "Here is your saved-week summary." ? expectedReply : "Your plan was saved and synced successfully.")
         });
         chatClient.Setup(c => c.CompleteChatAsync(
                 It.IsAny<IEnumerable<ChatMessage>>(), It.IsAny<ChatCompletionOptions>(), It.IsAny<CancellationToken>()))
@@ -960,13 +965,18 @@ public class DefaultAssistantServiceTests
             Assert.Contains(state.RecentMessages, m => m.Content.Contains("saved and synced", StringComparison.Ordinal));
             return;
         }
+        if (expectedReply == "Here is your saved-week summary.")
+        {
+            Assert.Contains(state.RecentMessages, m => m.Content == expectedReply);
+            return;
+        }
         Assert.All(state.RecentMessages, m => Assert.DoesNotContain("saved and synced", m.Content));
         Assert.All(stored.Where(m => m.Role == "Assistant"), m =>
         {
             Assert.DoesNotContain("saved and synced", m.Content);
             Assert.DoesNotContain("saved on your watch", m.Content);
         });
-        Assert.Contains(state.RecentMessages, m => m.Content.Contains("couldn't verify", StringComparison.Ordinal));
+        Assert.Contains(state.RecentMessages, m => m.Content.Replace("\r\n", "\n") == (expectedReply ?? AssistantToolResponsePolicy.UnverifiedResponse));
         this.mockSkillInvoker.Verify(i => i.InvokeAsync(
             It.Is<ChatToolCall>(call => call.FunctionName == "GenerateWeeklyPlanSkill"), It.IsAny<CancellationToken>()), Times.Never);
         var calls = stored.SelectMany(m => m.ToolCalls ?? Array.Empty<ChatToolCall>()).ToList();

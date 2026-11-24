@@ -79,6 +79,14 @@ public sealed class AssistantPostInputAttribute : InputBindingAttribute
     /// </summary>
     public string? ToolResponseOperations { get; set; }
 
+    /// <summary>
+    /// Gets or sets semicolon-separated prerequisite-read names. Incomplete,
+    /// failed or unverified reads use deterministic responses; verified ready
+    /// reads preserve normal coaching and downstream operation rendering.
+    /// </summary>
+    public string? ToolResponsePrerequisites { get; set; }
+
+
 
     /// <summary>
     /// Gets or sets the sampling temperature to use, between 0 and 2. Higher values like 0.8 will make the output

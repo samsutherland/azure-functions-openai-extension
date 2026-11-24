@@ -56,4 +56,12 @@ public sealed class AssistantPostAttribute : AssistantBaseAttribute
     /// </summary>
     public string? ToolResponseOperations { get; set; }
 
+    /// <summary>
+    /// Gets or sets semicolon-separated prerequisite-read names. Incomplete,
+    /// failed or unverified reads use deterministic responses; verified ready
+    /// reads preserve normal coaching and downstream operation rendering.
+    /// </summary>
+    public string? ToolResponsePrerequisites { get; set; }
+
+
 }
