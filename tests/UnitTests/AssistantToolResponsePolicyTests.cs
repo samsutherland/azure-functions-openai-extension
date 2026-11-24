@@ -79,6 +79,21 @@ public class AssistantToolResponsePolicyTests
         Assert.Equal("Goal: climb confidently.\nMonday: 0 hours." + Environment.NewLine + Environment.NewLine + "Does that feel right?", policy.Render());
     }
 
+    [Theory]
+    [InlineData(1, true)]
+    [InlineData(2, false)]
+    public void RecoveryReplacesOnlyTheSameAthletesStaleQuestion(int actor, bool recovered)
+    {
+        var policy = new AssistantToolResponsePolicy(null, "Check");
+        var call = ChatToolCall.CreateFunctionToolCall("read", "Check", BinaryData.FromString("{\"userId\":1}"));
+        policy.ObserveResults([new(call, """{"schemaVersion":1,"operation":"Check","actorId":1,"verified":true,"success":false,"outcome":"needs_user_input","nextQuestion":"Old confirmation?"}""", AssistantToolWorkflow.ToolExecutionDisposition.Invoked)]);
+        var result = Newtonsoft.Json.JsonConvert.SerializeObject(new { schemaVersion = 1, operation = "Check", actorId = actor,
+            success = true, ready = true, verified = true, outcome = "ready" });
+        policy.ObserveResults([new(call, result, AssistantToolWorkflow.ToolExecutionDisposition.Invoked, IsRecoveryRead: true)]);
+        Assert.True(policy.IsActive);
+        Assert.Equal(recovered ? "Your saved setup is ready." : "Old confirmation?", policy.Render());
+    }
+
     static AssistantToolResponsePolicy Observe(string result)
     {
         var policy = new AssistantToolResponsePolicy("Write");

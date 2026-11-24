@@ -39,10 +39,15 @@ internal sealed class AssistantToolResponsePolicy
     {
         foreach (AssistantToolWorkflow.ToolExecution execution in executions)
         {
+            bool replacesPriorRead = execution.IsRecoveryRead && this.results.Any(prior =>
+                AssistantPrerequisiteRecovery.SameVerifiedRead(prior.Call, prior.Result, execution.Call, execution.Result));
+            if (replacesPriorRead)
+                this.results.RemoveAll(prior => AssistantPrerequisiteRecovery.SameVerifiedRead(
+                    prior.Call, prior.Result, execution.Call, execution.Result));
             bool blockedPrerequisite = this.prerequisites.Contains(execution.Call.FunctionName)
                 && !IsVerifiedReady(execution);
             this.IsActive |= blockedPrerequisite;
-            if (blockedPrerequisite || this.operations.Contains(execution.Call.FunctionName))
+            if (blockedPrerequisite || replacesPriorRead || this.operations.Contains(execution.Call.FunctionName))
                 this.results.Add(execution);
         }
     }
