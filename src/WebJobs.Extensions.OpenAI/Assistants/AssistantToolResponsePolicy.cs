@@ -89,6 +89,22 @@ internal sealed class AssistantToolResponsePolicy
         {
             JObject? args = AssistantScopedReplacementResponse.Arguments(execution.Call);
             JObject? evidence = ParseVerifiedResult(execution);
+            JObject? conflict = AssistantScopedConflictResponse.ValidatedResult(execution);
+            if (conflict is not null)
+            {
+                current.RemoveAll(prior =>
+                {
+                    JObject? priorResult = ParseVerifiedResult(prior);
+                    JObject? priorArgs = AssistantScopedDeliveryResponse.Arguments(prior.Call);
+                    return conflict["weeklyPlanId"]?.Type == JTokenType.Integer
+                        && (JToken.DeepEquals(conflict["weeklyPlanId"], priorResult?["weeklyPlanId"])
+                            || JToken.DeepEquals(conflict["weeklyPlanId"], priorArgs?["weeklyPlanId"]))
+                        || execution.Call.FunctionName == "GenerateWeeklyPlanSkill" && priorResult?["savedDates"] is not null
+                            && JToken.DeepEquals(conflict["actorId"], priorResult["actorId"])
+                            && JToken.DeepEquals(conflict["weekStartDate"], priorResult["weekStartDate"])
+                            && JToken.DeepEquals(conflict["weekEndDate"], priorResult["weekEndDate"]);
+                });
+            }
             if (AssistantScopedReplacementResponse.IsReplacement(execution.Call) && args?["weeklyPlanId"] is not null)
             {
                 // A workout fingerprint is not a plan fingerprint. Retire earlier
@@ -154,6 +170,8 @@ internal sealed class AssistantToolResponsePolicy
 
     static string? RenderResult(AssistantToolWorkflow.ToolExecution execution)
     {
+        string? conflict = AssistantScopedConflictResponse.Render(execution);
+        if (conflict is not null) return conflict;
         if (AssistantScopedReplacementResponse.IsReplacement(execution.Call))
             return AssistantScopedReplacementResponse.Render(execution);
         if (AssistantScopedDeliveryResponse.IsDelivery(execution.Call))
