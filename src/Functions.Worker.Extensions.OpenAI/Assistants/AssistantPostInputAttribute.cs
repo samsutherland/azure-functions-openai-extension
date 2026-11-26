@@ -67,6 +67,13 @@ public sealed class AssistantPostInputAttribute : InputBindingAttribute
     public string CollectionName { get; set; } = "ChatState";
 
     /// <summary>
+    /// Semicolon-separated registered operations reserved for server invocation.
+    /// These operations are never advertised or invoked from model tool calls,
+    /// including when per-turn workflow context is disabled.
+    /// </summary>
+    public string? ToolInternalOperations { get; set; }
+
+    /// <summary>
     /// Optional registered read operation that authenticates the opaque request context
     /// and returns version-1 ephemeral instructions, allowed tools and trusted identity overrides.
     /// Null preserves existing behavior. Invalid or unavailable context fails closed.

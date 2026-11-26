@@ -16,17 +16,19 @@ namespace Microsoft.Azure.WebJobs.Extensions.OpenAI.Tests.Assistants;
 public partial class DefaultAssistantServiceTests
 {
     [Theory]
-    [InlineData(false, false)]
-    [InlineData(true, false)]
-    [InlineData(false, true)]
-    public async Task ContextRefreshesAfterToolsWithoutStoringSnapshotsAndBlocksHiddenCalls(bool failRefresh, bool hidden)
+    [InlineData(false, false, false)]
+    [InlineData(true, false, false)]
+    [InlineData(false, true, false)]
+    [InlineData(false, false, true)]
+    public async Task ContextRefreshesAfterToolsWithoutStoringSnapshotsAndBlocksHiddenCalls(bool failRefresh, bool hidden, bool internalOnly)
     {
         const string assistant = "context-test";
         var attribute = new AssistantPostAttribute(assistant, "Change my plan")
         {
-            WorkflowContextOperation = "Context", WorkflowContextArguments = "secret-header",
+            WorkflowContextOperation = internalOnly ? null : "Context", WorkflowContextArguments = "secret-header",
             ToolResponseOperations = "Write;Hidden"
         };
+        typeof(AssistantPostAttribute).GetProperty("ToolInternalOperations")?.SetValue(attribute, "Context");
         int contextCalls = 0, modelCalls = 0;
         var invoked = new List<ChatToolCall>();
         this.mockSkillInvoker.Setup(i => i.GetFunctionsDefinitions()).Returns(AssistantWorkflowContextTests.Tools());
@@ -53,11 +55,15 @@ public partial class DefaultAssistantServiceTests
             .ReturnsAsync((IEnumerable<ChatMessage> messages, ChatCompletionOptions options, CancellationToken _) =>
             {
                 modelCalls++;
-                Assert.Equal(new[] { "Write" }, options.Tools.Select(t => t.FunctionName));
-                Assert.Contains(messages, m => m is SystemChatMessage && m.Content.Any(c => c.Text == "snapshot-" + modelCalls));
+                if (internalOnly) Assert.DoesNotContain(options.Tools, t => t.FunctionName == "Context");
+                else
+                {
+                    Assert.Equal(new[] { "Write" }, options.Tools.Select(t => t.FunctionName));
+                    Assert.Contains(messages, m => m is SystemChatMessage && m.Content.Any(c => c.Text == "snapshot-" + modelCalls));
+                }
                 Assert.DoesNotContain(messages, m => m.Content.Any(c => c.Text?.Contains("secret-header", StringComparison.Ordinal) == true));
                 ChatCompletion response = modelCalls == 1 ? Completion("Everything is saved on your watch!",
-                    ChatToolCall.CreateFunctionToolCall("write", hidden ? "Hidden" : "Write",
+                    ChatToolCall.CreateFunctionToolCall("write", internalOnly ? "Context" : hidden ? "Hidden" : "Write",
                         BinaryData.FromString("{\"input\":\"{\\\"userId\\\":2,\\\"externalUserId\\\":\\\"victim\\\",\\\"date\\\":\\\"2026-11-26\\\"}\"}")))
                     : Completion("Everything is saved on your watch!");
                 return ClientResult.FromValue(response, new Mock<System.ClientModel.Primitives.PipelineResponse>().Object);
@@ -81,27 +87,27 @@ public partial class DefaultAssistantServiceTests
             this.mockSkillInvoker.Object, this.mockLoggerFactory.Object);
         typeof(DefaultAssistantService).GetField("tableClient", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.SetValue(service, this.mockTableClient.Object);
         var state = await service.PostMessageAsync(attribute, CancellationToken.None);
-        string expected = hidden ? AssistantWorkflowContext.BlockedResponse : failRefresh ? AssistantWorkflowContext.UnavailableResponse
+        string expected = hidden || internalOnly ? AssistantWorkflowContext.BlockedResponse : failRefresh ? AssistantWorkflowContext.UnavailableResponse
             : "Your change was saved and verified in the app. Device delivery is not confirmed.";
         Assert.Contains(state.RecentMessages, m => m.Content == expected);
         Assert.Contains(stored, m => m.Role == "Assistant" && m.Content == expected);
         Assert.All(stored.Where(m => m.Role == "Assistant"), m => Assert.DoesNotContain("on your watch", m.Content));
         Assert.DoesNotContain(stored, m => m.Content.Contains("snapshot-", StringComparison.Ordinal) || m.Content.Contains("secret-header", StringComparison.Ordinal));
-        Assert.Equal(hidden ? 1 : 2, contextCalls);
-        Assert.Equal(hidden || failRefresh ? 1 : 2, modelCalls);
-        Assert.Equal(hidden ? 0 : 1, invoked.Count);
-        if (!hidden)
+        Assert.Equal(internalOnly ? 0 : hidden ? 1 : 2, contextCalls);
+        Assert.Equal(internalOnly || hidden || failRefresh ? 1 : 2, modelCalls);
+        Assert.Equal(internalOnly || hidden ? 0 : 1, invoked.Count);
+        if (!hidden && !internalOnly)
         {
             var actual = JObject.Parse(JObject.Parse(invoked.Single().FunctionArguments.ToString())["input"]!.Value<string>()!);
             Assert.Equal(1, actual["userId"]); Assert.Equal("owner", actual["externalUserId"]);
         }
         var calls = stored.SelectMany(m => m.ToolCalls ?? Array.Empty<ChatToolCall>()).ToList();
         Assert.Equal(calls.Select(c => c.Id), stored.Where(m => m.Role == "Tool").Select(m => m.Name));
-        Assert.DoesNotContain(calls, c => c.FunctionName == "Context");
-        if (!hidden) Assert.Equal(invoked.Single().FunctionArguments.ToString(), calls.Single().FunctionArguments.ToString());
+        if (!internalOnly) Assert.DoesNotContain(calls, c => c.FunctionName == "Context");
+        if (!hidden && !internalOnly) Assert.Equal(invoked.Single().FunctionArguments.ToString(), calls.Single().FunctionArguments.ToString());
         var telemetry = this.mockLogger.Invocations.Where(i => i.Method.Name == "Log").Select(i => i.Arguments[2]?.ToString() ?? "")
             .Where(message => message.StartsWith("Workflow context", StringComparison.Ordinal)).ToList();
-        Assert.Contains(telemetry, message => message.Contains("policyVersion=workflow-context-v1", StringComparison.Ordinal)
+        if (!internalOnly) Assert.Contains(telemetry, message => message.Contains("policyVersion=workflow-context-v1", StringComparison.Ordinal)
             && message.Contains("selectedToolCount=1", StringComparison.Ordinal) && message.Contains("latencyMs=", StringComparison.Ordinal));
         Assert.All(telemetry, message => { Assert.DoesNotContain("secret-header", message); Assert.DoesNotContain("snapshot-", message); });
     }

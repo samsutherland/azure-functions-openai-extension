@@ -333,6 +333,8 @@ class DefaultAssistantService : IAssistantService
         AssistantWorkflowContext? initialContext = null)
     {
         IList<ChatTool>? functions = this.skillInvoker.GetFunctionsDefinitions();
+        var internalOperations = new HashSet<string>((attribute.ToolInternalOperations ?? "").Split(';')
+            .Select(name => name.Trim()).Where(name => name.Length > 0), StringComparer.OrdinalIgnoreCase);
         AssistantToolWorkflow workflow = new(AssistantToolWorkflow.ParseDependencyRules(attribute.ToolWorkflowDependencies),
             AssistantToolWorkflow.ParseDependencyRules(attribute.ToolWorkflowRecoveryReads));
         AssistantToolResponsePolicy responsePolicy = new(attribute.ToolResponseOperations, attribute.ToolResponsePrerequisites);
@@ -370,7 +372,7 @@ class DefaultAssistantService : IAssistantService
                 break;
             }
             ClientResult<ChatCompletion> response = await this.GetLLMResponse(attribute, chatState,
-                context?.AllowedTools ?? functions, cancellationToken, context?.Instructions);
+                (context?.AllowedTools ?? functions)?.Where(tool => !internalOperations.Contains(tool.FunctionName)).ToList(), cancellationToken, context?.Instructions);
 
             List<ChatToolCall> functionCalls = response.Value.ToolCalls.Select(call => context?.Canonicalize(call) ?? call).ToList();
             responsePolicy.ObserveCalls(functionCalls);
@@ -383,7 +385,7 @@ class DefaultAssistantService : IAssistantService
             if (functionCalls.Count > 0 && batch.Count + functionCalls.Count + 3 > FunctionCallBatchLimit)
             {
                 responsePolicy.ObserveUnexecutedCalls(functionCalls);
-                if (responsePolicy.IsActive || context is not null)
+                if (responsePolicy.IsActive || context is not null || functionCalls.Any(call => internalOperations.Contains(call.FunctionName)))
                     ClearTurnModelProse();
                 this.LogBatchLimitExceeded(attribute.Id, functionCalls.Count);
                 this.LogAndAddAssistantReply(attribute.Id,
@@ -404,7 +406,7 @@ class DefaultAssistantService : IAssistantService
             }
 
             IReadOnlyList<AssistantToolWorkflow.ToolExecution> executions = await this.ProcessFunctionCalls(
-                attribute.Id, functionCalls, chatState, batch, workflow, cancellationToken, context);
+                attribute.Id, functionCalls, chatState, batch, workflow, cancellationToken, context, internalOperations);
             responsePolicy.ObserveResults(executions);
             if (executions.Any(e => e.Disposition == AssistantToolWorkflow.ToolExecutionDisposition.ContextBlocked))
             {
@@ -830,7 +832,7 @@ class DefaultAssistantService : IAssistantService
         InternalChatState chatState,
         List<TableTransactionAction> batch,
         AssistantToolWorkflow workflow,
-        CancellationToken cancellationToken, AssistantWorkflowContext? context = null)
+        CancellationToken cancellationToken, AssistantWorkflowContext? context = null, ISet<string>? internalOperations = null)
     {
         this.logger.LogInformation(
             "[{Id}] Found {Count} function call(s) in response",
@@ -844,7 +846,8 @@ class DefaultAssistantService : IAssistantService
                     assistantId,
                     call,
                     workflow,
-                    cancellationToken, context), context is null ? null : context.Allows);
+                    cancellationToken, context), context is null && (internalOperations is null || internalOperations.Count == 0) ? null
+                        : call => internalOperations?.Contains(call.FunctionName) != true && (context?.Allows(call) ?? true));
 
         foreach (AssistantToolWorkflow.ToolExecution execution in executions)
         {
