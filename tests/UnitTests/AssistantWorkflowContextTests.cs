@@ -129,6 +129,25 @@ public class AssistantWorkflowContextTests
         Assert.Null(await AssistantWorkflowContext.LoadAsync(invoker.Object, "Context", "opaque", "assistant", Tools(), CancellationToken.None));
     }
 
+    [Theory]
+    [InlineData("actorId", "2")]
+    [InlineData("operation", "\"ReplaceWeeklyWorkoutSkill\"")]
+    [InlineData("existingPlanPreserved", "false")]
+    [InlineData("weeklyPlanId", "0")]
+    [InlineData("userFacingStatus", "oversized")]
+    [InlineData("conflictEvidenceVerified", "false")]
+    [InlineData("persisted", "true")]
+    [InlineData("completenessViolations", "[]")]
+    public async Task InvalidCurrentPlanConflictRejectsContext(string property, string value)
+    {
+        var result = JObject.Parse(Result()); result["toolArgumentOverrides"] = new JObject { ["userId"] = 1 };
+        var rejection = AssistantScopedConflictResponseTests.Result("power_target_missing");
+        rejection[property] = value == "oversized" ? new JValue(new string('x', 32769)) : JToken.Parse(value); result["responseConflict"] = rejection;
+        var invoker = new Mock<IAssistantSkillInvoker>();
+        invoker.Setup(i => i.InvokeAsync(It.IsAny<ChatToolCall>(), It.IsAny<CancellationToken>())).ReturnsAsync(result.ToString());
+        Assert.Null(await AssistantWorkflowContext.LoadAsync(invoker.Object, "Context", "opaque", "assistant", Tools(), CancellationToken.None));
+    }
+
     internal static JObject Prerequisite(bool ready, string question) => JObject.FromObject(new
     {
         schemaVersion = 1, operation = "GetTrainingSetupStatusSkill", actorId = 1, verified = true,

@@ -18,6 +18,7 @@ internal sealed class AssistantToolResponsePolicy
     readonly List<AssistantToolWorkflow.ToolExecution> results = new();
     readonly List<ChatToolCall> unexecutedScopedCalls = new();
     AssistantToolWorkflow.ToolExecution? contextPrerequisite;
+    AssistantToolWorkflow.ToolExecution? contextConflict;
 
     internal AssistantToolResponsePolicy(string? operationNames, string? prerequisiteNames = null)
     {
@@ -50,6 +51,9 @@ internal sealed class AssistantToolResponsePolicy
             && JToken.DeepEquals(ParseVerifiedResult(prior)?["actorId"], result["actorId"]));
         if (!IsVerifiedReady(execution)) this.contextPrerequisite = execution;
     }
+
+    // Replaced on every snapshot; never enters executed results or prerequisites.
+    internal void ObserveContextConflict(AssistantToolWorkflow.ToolExecution? evidence) => this.contextConflict = evidence;
 
     internal void ObserveCalls(IEnumerable<ChatToolCall> calls) =>
         this.IsActive |= calls.Any(call => this.operations.Contains(call.FunctionName));
@@ -94,7 +98,7 @@ internal sealed class AssistantToolResponsePolicy
     internal string Render()
     {
         if (this.hasUnexecutedSensitiveCalls) return UnverifiedResponse;
-        if (this.results.Count == 0 && this.unexecutedScopedCalls.Count == 0)
+        if (this.results.Count == 0 && this.unexecutedScopedCalls.Count == 0 && this.contextConflict is null)
             return this.contextPrerequisite is null ? UnverifiedResponse : RenderResult(this.contextPrerequisite) ?? UnverifiedResponse;
 
         var messages = new List<string>();
@@ -190,7 +194,17 @@ internal sealed class AssistantToolResponsePolicy
             if (question is null) return UnverifiedResponse;
             messages.Insert(0, question);
         }
-        return string.Join(Environment.NewLine + Environment.NewLine, messages.Distinct());
+        // Executed mutations own their outcome. A current snapshot can explain
+        // only turns with no executed operation, including model reads/no calls.
+        if (this.IsActive && this.contextConflict is not null
+            && !this.results.Any(e => this.operations.Contains(e.Call.FunctionName)
+                && e.Disposition == AssistantToolWorkflow.ToolExecutionDisposition.Invoked))
+        {
+            string? conflict = AssistantScopedConflictResponse.Render(this.contextConflict);
+            if (conflict is null) return UnverifiedResponse;
+            messages.Add(conflict);
+        }
+        return messages.Count == 0 ? UnverifiedResponse : string.Join(Environment.NewLine + Environment.NewLine, messages.Distinct());
     }
 
     static string? RenderResult(AssistantToolWorkflow.ToolExecution execution)

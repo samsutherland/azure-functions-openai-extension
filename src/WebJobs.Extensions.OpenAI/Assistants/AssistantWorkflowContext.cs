@@ -10,7 +10,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.OpenAI.Assistants;
 
 // The configured context operation owns authentication, authorization and snapshot
 // freshness. Its opaque request context is used only for the internal invocation.
-internal sealed record AssistantWorkflowContext(string Instructions, IList<ChatTool> AllowedTools, JObject? ArgumentOverrides, bool RequireOperationEvidence, JObject? ResponsePrerequisite)
+internal sealed record AssistantWorkflowContext(string Instructions, IList<ChatTool> AllowedTools, JObject? ArgumentOverrides, bool RequireOperationEvidence, JObject? ResponsePrerequisite, AssistantToolWorkflow.ToolExecution? ResponseConflict)
 {
     internal const string UnavailableResponse = "I couldn't verify the current workflow context. Please try again; completion and provider delivery are not confirmed.";
     internal const string BlockedResponse = "A requested tool is unavailable for the current workflow. Completion and provider delivery are not confirmed.";
@@ -68,7 +68,14 @@ internal sealed record AssistantWorkflowContext(string Instructions, IList<ChatT
                 || True(read["ready"]) && !string.IsNullOrWhiteSpace(read["nextQuestion"]?.Value<string>())) return null;
             prerequisite = (JObject)read.DeepClone();
         }
-        return new(result["instructions"]!.Value<string>()!, registered.Where(t => names.Any(n => n.Value<string>() == t.FunctionName)).ToList(), overrides, True(result["requireOperationEvidence"]), prerequisite);
+        AssistantToolWorkflow.ToolExecution? conflict = null;
+        if (result["responseConflict"] is JToken conflictToken && conflictToken.Type != JTokenType.Null)
+        {
+            if (conflictToken is not JObject rejection || rejection.ToString(Formatting.None).Length > 32768
+                || overrides?["userId"] is null
+                || (conflict = AssistantScopedConflictResponse.ContextEvidence(rejection, overrides["userId"]!)) is null) return null;
+        }
+        return new(result["instructions"]!.Value<string>()!, registered.Where(t => names.Any(n => n.Value<string>() == t.FunctionName)).ToList(), overrides, True(result["requireOperationEvidence"]), prerequisite, conflict);
     }
 
     internal ChatToolCall? Canonicalize(ChatToolCall call)

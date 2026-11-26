@@ -20,6 +20,19 @@ internal static class AssistantScopedConflictResponse
         ["protected_constraint_unverifiable"] = "A protected training requirement overlaps this date. Its compatibility and any safety conflict need review; no session should be forced or silently omitted."
     };
 
+    // Snapshot evidence is an assessment of the existing plan, never execution
+    // credit. Bind its negative contract to the authenticated actor and exact week.
+    internal static AssistantToolWorkflow.ToolExecution? ContextEvidence(JObject result, JToken actor)
+    {
+        if (Text(result["operation"]) != "GenerateWeeklyPlanSkill" || !PositiveId(actor)
+            || !JToken.DeepEquals(actor, result["actorId"]) || !PositiveId(result["weeklyPlanId"])
+            || !True(result["existingPlanPreserved"])) return null;
+        var call = ChatToolCall.CreateFunctionToolCall("context-conflict", "GenerateWeeklyPlanSkill", BinaryData.FromString(
+            new JObject { ["userId"] = actor.DeepClone(), ["weekStart"] = result["weekStartDate"]?.DeepClone() }.ToString()));
+        var evidence = new AssistantToolWorkflow.ToolExecution(call, result.ToString(), AssistantToolWorkflow.ToolExecutionDisposition.Invoked);
+        return ValidatedResult(evidence) is null ? null : evidence;
+    }
+
     internal static JObject? ValidatedResult(AssistantToolWorkflow.ToolExecution execution)
     {
         if (execution.Disposition != AssistantToolWorkflow.ToolExecutionDisposition.Invoked

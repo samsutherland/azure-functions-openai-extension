@@ -368,7 +368,11 @@ class DefaultAssistantService : IAssistantService
                 responsePolicy.RequireOperationEvidence();
                 ClearTurnModelProse();
             }
-            if (context is not null) responsePolicy.ObserveContextPrerequisite(context.ResponsePrerequisite);
+            if (context is not null)
+            {
+                responsePolicy.ObserveContextPrerequisite(context.ResponsePrerequisite);
+                responsePolicy.ObserveContextConflict(context.ResponseConflict);
+            }
             if (context is not null && (context.Instructions.Length + ApproximateCharsPerToken - 1) / ApproximateCharsPerToken + MessageTokenOverhead
                 >= this.GetMaxContextTokens() - ReservedForResponseTokens - ReservedForFunctionTokens)
             {

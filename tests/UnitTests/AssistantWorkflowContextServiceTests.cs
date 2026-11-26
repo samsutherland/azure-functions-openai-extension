@@ -29,13 +29,24 @@ public partial class DefaultAssistantServiceTests
     [InlineData(false, false, false, "setup_question_refresh_required")]
     [InlineData(false, false, false, "setup_question_update_required")]
     [InlineData(false, false, false, "setup_dependency_blocked_required")]
+    [InlineData(false, false, false, "conflict_no_calls_required")]
+    [InlineData(false, false, false, "conflict_read_required")]
+    [InlineData(false, false, false, "conflict_power_no_calls_required")]
+    [InlineData(false, false, false, "conflict_power_read_required")]
+    [InlineData(false, false, false, "conflict_cleared_required")]
+    [InlineData(false, false, false, "conflict_unknown_required")]
+    [InlineData(false, false, false, "conflict_write_required")]
+    [InlineData(false, false, false, "conflict_advice")]
     public async Task ContextRefreshesAfterToolsWithoutStoringSnapshotsAndBlocksHiddenCalls(bool failRefresh, bool hidden, bool internalOnly, string evidenceMode)
     {
         const string assistant = "context-test";
+        bool powerConflict = evidenceMode.Contains("_power_", StringComparison.Ordinal);
+        bool conflict = evidenceMode.StartsWith("conflict_", StringComparison.Ordinal);
         bool dependencyBlocked = evidenceMode == "setup_dependency_blocked_required";
-        bool advice = evidenceMode is "advice" or "missing_setup_advice";
-        bool noCalls = evidenceMode is "no_calls_required" or "advice" or "missing_setup_required" or "missing_setup_advice";
-        bool readOnly = evidenceMode is "read_only_required" or "setup_question_refresh_required" or "setup_question_update_required";
+        bool advice = evidenceMode is "advice" or "missing_setup_advice" or "conflict_advice";
+        bool noCalls = evidenceMode is "no_calls_required" or "advice" or "missing_setup_required" or "missing_setup_advice" or "conflict_no_calls_required" or "conflict_advice" or "conflict_power_no_calls_required";
+        bool readOnly = evidenceMode is "read_only_required" or "setup_question_refresh_required" or "setup_question_update_required" or "conflict_read_required" or "conflict_cleared_required" or "conflict_power_read_required";
+        string selectedOperation = evidenceMode == "conflict_unknown_required" ? "GenerateWeeklyPlanSkill" : readOnly ? "Read" : "Write";
         var attribute = new AssistantPostAttribute(assistant, "Change my plan")
         {
             WorkflowContextOperation = internalOnly ? null : "Context", WorkflowContextArguments = "secret-header",
@@ -55,6 +66,7 @@ public partial class DefaultAssistantServiceTests
                 if (call.FunctionName != "Context")
                 {
                     invoked.Add(call);
+                    if (evidenceMode == "conflict_unknown_required") return "{}";
                     if (call.FunctionName == "GetTrainingSetupStatusSkill") return AssistantWorkflowContextTests.Prerequisite(false, "What is your first name?").ToString();
                     if (call.FunctionName == "Read") return "{\"success\":true,\"data\":[1]}";
                     return "{\"schemaVersion\":1,\"operation\":\"Write\",\"verified\":true,\"persisted\":true,\"success\":true,\"outcome\":\"saved\",\"canTellAthleteSaved\":true}";
@@ -65,11 +77,13 @@ public partial class DefaultAssistantServiceTests
                 Assert.Equal(assistant, input["assistantId"]);
                 Assert.Equal("Change my plan", input["userMessage"]);
                 if (failRefresh && contextCalls > 1) return "{}";
-                var result = JObject.Parse(AssistantWorkflowContextTests.Result("snapshot-" + contextCalls, readOnly ? "Read" : "Write"));
+                var result = JObject.Parse(AssistantWorkflowContextTests.Result("snapshot-" + contextCalls, selectedOperation));
                 if (dependencyBlocked) result["allowedToolNames"] = new JArray("GetTrainingSetupStatusSkill", "GenerateWeeklyPlanSkill");
                 if (evidenceMode.Length > 0) result["requireOperationEvidence"] = evidenceMode.EndsWith("required", StringComparison.Ordinal)
                     && (evidenceMode != "read_only_required" || contextCalls == 1);
                 result["toolArgumentOverrides"] = new JObject { ["userId"] = 1, ["externalUserId"] = "owner" };
+                if (conflict && (evidenceMode != "conflict_cleared_required" || contextCalls == 1))
+                    result["responseConflict"] = AssistantScopedConflictResponseTests.Result(powerConflict ? "power_target_missing" : "protected_constraint_unverifiable");
                 if (dependencyBlocked) result["responsePrerequisite"] = AssistantWorkflowContextTests.Prerequisite(false, "What is your first name?");
                 else if (evidenceMode.StartsWith("missing_setup", StringComparison.Ordinal))
                     result["responsePrerequisite"] = AssistantWorkflowContextTests.Prerequisite(false, "What is your goal?");
@@ -87,7 +101,7 @@ public partial class DefaultAssistantServiceTests
                 if (internalOnly) Assert.DoesNotContain(options.Tools, t => t.FunctionName == "Context");
                 else
                 {
-                    Assert.Equal(dependencyBlocked ? new[] { "GetTrainingSetupStatusSkill", "GenerateWeeklyPlanSkill" } : new[] { readOnly ? "Read" : "Write" }, options.Tools.Select(t => t.FunctionName));
+                    Assert.Equal(dependencyBlocked ? new[] { "GetTrainingSetupStatusSkill", "GenerateWeeklyPlanSkill" } : new[] { selectedOperation }, options.Tools.Select(t => t.FunctionName));
                     Assert.Contains(messages, m => m is SystemChatMessage && m.Content.Any(c => c.Text == "snapshot-" + modelCalls));
                 }
                 Assert.DoesNotContain(messages, m => m.Content.Any(c => c.Text?.Contains("secret-header", StringComparison.Ordinal) == true));
@@ -96,7 +110,7 @@ public partial class DefaultAssistantServiceTests
                         BinaryData.FromString("{\"input\":\"{\\\"userId\\\":2}\"}")))
                     : noCalls ? Completion(advice ? "Keep tomorrow easy and review how you feel." : "Everything is saved on your watch!")
                     : modelCalls == 1 ? Completion("Everything is saved on your watch!",
-                    ChatToolCall.CreateFunctionToolCall("write", internalOnly ? "Context" : hidden ? "Hidden" : readOnly ? "Read" : "Write",
+                    ChatToolCall.CreateFunctionToolCall("write", internalOnly ? "Context" : hidden ? "Hidden" : selectedOperation,
                         BinaryData.FromString("{\"input\":\"{\\\"userId\\\":2,\\\"externalUserId\\\":\\\"victim\\\",\\\"date\\\":\\\"2026-11-26\\\"}\"}")))
                     : Completion("Everything is saved on your watch!");
                 return ClientResult.FromValue(response, new Mock<System.ClientModel.Primitives.PipelineResponse>().Object);
@@ -121,6 +135,11 @@ public partial class DefaultAssistantServiceTests
         typeof(DefaultAssistantService).GetField("tableClient", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.SetValue(service, this.mockTableClient.Object);
         var state = await service.PostMessageAsync(attribute, CancellationToken.None);
         string expected = advice ? "Keep tomorrow easy and review how you feel."
+            : conflict && evidenceMode is "conflict_no_calls_required" or "conflict_read_required" or "conflict_power_no_calls_required" or "conflict_power_read_required" ? AssistantScopedConflictResponseTests.Header
+                + Environment.NewLine + "2026-11-26: " + (powerConflict ? "Cycling work needs explicit power targets." : "A protected training requirement overlaps this date. Its compatibility and any safety conflict need review; no session should be forced or silently omitted.")
+                + Environment.NewLine + AssistantScopedConflictResponseTests.Footer
+            : evidenceMode == "conflict_write_required" ? "Your change was saved and verified in the app. Device delivery is not confirmed."
+            : conflict ? AssistantToolResponsePolicy.UnverifiedResponse
             : dependencyBlocked ? "Your saved goal and availability." + Environment.NewLine + Environment.NewLine + "What is your first name?" + Environment.NewLine + Environment.NewLine + "The requested operation was not attempted. Completion and provider delivery are not confirmed."
             : evidenceMode == "missing_setup_required" ? "Your saved goal and availability." + Environment.NewLine + Environment.NewLine + "What is your goal?"
             : evidenceMode == "setup_question_update_required" ? "Your saved goal and availability." + Environment.NewLine + Environment.NewLine + "New question?"
@@ -141,6 +160,7 @@ public partial class DefaultAssistantServiceTests
         }
         var calls = stored.SelectMany(m => m.ToolCalls ?? Array.Empty<ChatToolCall>()).ToList();
         Assert.Equal(calls.Select(c => c.Id), stored.Where(m => m.Role == "Tool").Select(m => m.Name));
+        Assert.DoesNotContain(calls, c => c.Id == "context-conflict");
         if (!internalOnly) Assert.DoesNotContain(calls, c => c.FunctionName == "Context");
         if (!hidden && !internalOnly && !noCalls) Assert.Equal(invoked.Single().FunctionArguments.ToString(), calls.First().FunctionArguments.ToString());
         var responseTelemetry = this.mockLogger.Invocations.Where(i => i.Method.Name == "Log").Select(i => i.Arguments[2]?.ToString() ?? "")
