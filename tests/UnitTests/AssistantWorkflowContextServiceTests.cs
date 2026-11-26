@@ -54,7 +54,8 @@ public partial class DefaultAssistantServiceTests
                 Assert.Equal("Change my plan", input["userMessage"]);
                 if (failRefresh && contextCalls > 1) return "{}";
                 var result = JObject.Parse(AssistantWorkflowContextTests.Result("snapshot-" + contextCalls, readOnly ? "Read" : "Write"));
-                if (evidenceMode.Length > 0) result["requireOperationEvidence"] = evidenceMode.EndsWith("required", StringComparison.Ordinal);
+                if (evidenceMode.Length > 0) result["requireOperationEvidence"] = evidenceMode.EndsWith("required", StringComparison.Ordinal)
+                    && (evidenceMode != "read_only_required" || contextCalls == 1);
                 result["toolArgumentOverrides"] = new JObject { ["userId"] = 1, ["externalUserId"] = "owner" };
                 return result.ToString();
             });
