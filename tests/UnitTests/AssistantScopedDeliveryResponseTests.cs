@@ -143,6 +143,18 @@ public class AssistantScopedDeliveryResponseTests
         Assert.Contains("2026-11-27: Garmin accepted", policy.Render());
     }
 
+    [Fact]
+    public void UnknownSyncRetiresAnEarlierWholePlanDeliveryReceipt()
+    {
+        var policy = new AssistantToolResponsePolicy("FinalizeWeeklyPlanSkill;SyncWorkoutToProviderSkill");
+        var first = Result(); first["deliveryOutcomes"] = new JArray(Receipt("2026-11-26", "garmin", "schedule_created_watch_sync_required", true));
+        policy.ObserveResults([new(Call(), first.ToString(), AssistantToolWorkflow.ToolExecutionDisposition.Invoked)]);
+        var call = ChatToolCall.CreateFunctionToolCall("sync", "SyncWorkoutToProviderSkill", BinaryData.FromString("{\"userId\":1,\"weeklyPlanId\":15,\"date\":\"2026-11-26\"}"));
+        policy.ObserveResults([new(call, "{}", AssistantToolWorkflow.ToolExecutionDisposition.Invoked)]);
+        Assert.DoesNotContain("accepted", policy.Render());
+        Assert.Contains("couldn't verify", policy.Render());
+    }
+
     internal static JObject Result(string operation = "FinalizeWeeklyPlanSkill") => JObject.FromObject(new
     {
         schemaVersion = 1, operation, actorId = 1, weeklyPlanId = 15,

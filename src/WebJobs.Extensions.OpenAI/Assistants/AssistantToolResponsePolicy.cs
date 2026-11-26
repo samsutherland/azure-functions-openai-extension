@@ -112,7 +112,7 @@ internal sealed class AssistantToolResponsePolicy
                     return deliveryArgs?["weeklyPlanId"] is not null
                         && (JToken.DeepEquals(priorArgs?["weeklyPlanId"], deliveryArgs["weeklyPlanId"])
                             || JToken.DeepEquals(priorResult?["weeklyPlanId"], deliveryArgs["weeklyPlanId"]))
-                        && (execution.Call.FunctionName == "FinalizeWeeklyPlanSkill"
+                        && (execution.Call.FunctionName == "FinalizeWeeklyPlanSkill" || prior.Call.FunctionName == "FinalizeWeeklyPlanSkill"
                             || priorResult?["savedDates"] is not null && !AssistantScopedDeliveryResponse.IsDelivery(prior.Call)
                             || JToken.DeepEquals(priorArgs?["date"], deliveryArgs["date"]));
                 });
