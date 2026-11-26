@@ -15,6 +15,7 @@ internal sealed class AssistantToolResponsePolicy
     readonly HashSet<string> operations;
     readonly HashSet<string> prerequisites;
     readonly List<AssistantToolWorkflow.ToolExecution> results = new();
+    readonly List<ChatToolCall> unexecutedReplacementCalls = new();
 
     internal AssistantToolResponsePolicy(string? operationNames, string? prerequisiteNames = null)
     {
@@ -33,9 +34,15 @@ internal sealed class AssistantToolResponsePolicy
 
     internal void ObserveUnexecutedCalls(IEnumerable<ChatToolCall> calls)
     {
-        this.hasUnexecutedSensitiveCalls |= calls.Any(call => this.operations.Contains(call.FunctionName)
-            || this.prerequisites.Contains(call.FunctionName));
-        this.IsActive |= this.hasUnexecutedSensitiveCalls;
+        foreach (ChatToolCall call in calls)
+        {
+            if (!this.operations.Contains(call.FunctionName) && !this.prerequisites.Contains(call.FunctionName)) continue;
+            this.IsActive = true;
+            if (this.operations.Contains(call.FunctionName) && AssistantScopedReplacementResponse.IsReplacement(call))
+                this.unexecutedReplacementCalls.Add(call);
+            else
+                this.hasUnexecutedSensitiveCalls = true;
+        }
     }
 
     internal void ObserveResults(IEnumerable<AssistantToolWorkflow.ToolExecution> executions)
@@ -64,17 +71,46 @@ internal sealed class AssistantToolResponsePolicy
 
     internal string Render()
     {
-        if (this.results.Count == 0 || this.hasUnexecutedSensitiveCalls)
+        if ((this.results.Count == 0 && this.unexecutedReplacementCalls.Count == 0) || this.hasUnexecutedSensitiveCalls)
         {
             return UnverifiedResponse;
         }
 
         var messages = new List<string>();
         var planRevisions = new Dictionary<string, string>();
-        foreach (AssistantToolWorkflow.ToolExecution execution in this.results)
+        var current = new List<AssistantToolWorkflow.ToolExecution>();
+        foreach (AssistantToolWorkflow.ToolExecution execution in this.results.Concat(this.unexecutedReplacementCalls.Select(call =>
+            new AssistantToolWorkflow.ToolExecution(call, "", AssistantToolWorkflow.ToolExecutionDisposition.DependencyBlocked))))
+        {
+            JObject? args = AssistantScopedReplacementResponse.Arguments(execution.Call);
+            JObject? evidence = ParseVerifiedResult(execution);
+            if (AssistantScopedReplacementResponse.IsReplacement(execution.Call) && args?["weeklyPlanId"] is not null)
+            {
+                // A workout fingerprint is not a plan fingerprint. Retire earlier
+                // whole-plan claims after any attempted edit, including uncertain writes.
+                current.RemoveAll(prior =>
+                {
+                    JObject? priorResult = ParseVerifiedResult(prior);
+                    JObject? priorArgs = AssistantScopedReplacementResponse.Arguments(prior.Call);
+                    return priorResult?["weeklyPlanId"] is not null
+                        && JToken.DeepEquals(priorResult["weeklyPlanId"], args["weeklyPlanId"])
+                        && priorResult["savedDates"] is not null
+                        || AssistantScopedReplacementResponse.IsReplacement(prior.Call)
+                        && JToken.DeepEquals(priorArgs?["weeklyPlanId"], args["weeklyPlanId"])
+                        && JToken.DeepEquals(priorArgs?["date"], args["date"]);
+                });
+            }
+            else if (evidence?["savedDates"] is not null)
+            {
+                current.RemoveAll(prior => AssistantScopedReplacementResponse.IsReplacement(prior.Call)
+                    && JToken.DeepEquals(AssistantScopedReplacementResponse.Arguments(prior.Call)?["weeklyPlanId"], evidence["weeklyPlanId"]));
+            }
+            current.Add(execution);
+        }
+        foreach (AssistantToolWorkflow.ToolExecution execution in current)
         {
             JObject? evidence = ParseVerifiedResult(execution);
-            if (evidence?["weeklyPlanId"] is not null)
+            if (evidence?["savedDates"] is not null && evidence["weeklyPlanId"] is not null)
             {
                 string scope = evidence["actorId"] + ":" + evidence["weeklyPlanId"];
                 string revision = evidence["revision"]?.ToString() ?? "";
@@ -96,6 +132,8 @@ internal sealed class AssistantToolResponsePolicy
 
     static string? RenderResult(AssistantToolWorkflow.ToolExecution execution)
     {
+        if (AssistantScopedReplacementResponse.IsReplacement(execution.Call))
+            return AssistantScopedReplacementResponse.Render(execution);
         // Runtime disposition proves this attempt had no side effects. Preserve a
         // verified prerequisite question alongside it; invoked/unknown results still fail closed.
         if (execution.Disposition == AssistantToolWorkflow.ToolExecutionDisposition.DependencyBlocked)

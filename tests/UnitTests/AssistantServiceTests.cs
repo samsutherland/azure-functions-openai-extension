@@ -926,6 +926,19 @@ public partial class DefaultAssistantServiceTests
     }
 
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PostMessageAsync_ReplacementEvidencePreservesPartialDatesAndPairs(bool partial)
+    {
+        const string setup = "{\"schemaVersion\":1,\"operation\":\"GetTrainingSetupStatusSkill\",\"success\":true,\"verified\":true,\"outcome\":\"ready\",\"ready\":true}";
+        string expected = "2026-11-26: Your replacement workout was saved and verified in the app. Provider delivery is not confirmed.";
+        if (partial) expected += "\n\n2026-11-27: I couldn't verify the replacement. Check the saved workout before trying again; saved changes and provider delivery are not confirmed.";
+        await PostMessageAsync_EvidencePolicySuppressesFalseClaimsInStoredAndReturnedMessages(setup, 1,
+            expectedReply: expected, planResult: Newtonsoft.Json.JsonConvert.SerializeObject(AssistantScopedReplacementResponseTests.Saved().ToString()),
+            planCount: partial ? 2 : 1, replacement: true, secondReplacementResult: "{}");
+    }
+
+    [Theory]
     [InlineData("{\"success\":false,\"outcome\":\"failed\"}", 1)]
     [InlineData("", 1)]
     [InlineData("not-json", 1)]
@@ -937,9 +950,10 @@ public partial class DefaultAssistantServiceTests
     [InlineData("{\"schemaVersion\":1,\"operation\":\"GetTrainingSetupStatusSkill\",\"success\":false,\"verified\":true,\"outcome\":\"needs_user_input\",\"promptContext\":\"Goal: climb confidently. Monday: 0 hours.\",\"nextQuestion\":\"Does that feel right?\"}", 1, true, true, "Goal: climb confidently. Monday: 0 hours.\n\nDoes that feel right?")]
     [InlineData("{\"schemaVersion\":1,\"operation\":\"GetTrainingSetupStatusSkill\",\"success\":true,\"verified\":true,\"outcome\":\"ready\",\"ready\":true}", 1, true, true, "Here is your saved-week summary.")]
     public async Task PostMessageAsync_EvidencePolicySuppressesFalseClaimsInStoredAndReturnedMessages(
-        string setupResult, int toolCount, bool enabled = true, bool prerequisiteOnly = false, string? expectedReply = null, string? planResult = null, int planCount = 1)
+        string setupResult, int toolCount, bool enabled = true, bool prerequisiteOnly = false, string? expectedReply = null, string? planResult = null, int planCount = 1, bool replacement = false, string? secondReplacementResult = null)
     {
         const string assistantId = "evidence-test";
+        string operation = replacement ? "ReplaceWeeklyWorkoutSkill" : "GenerateWeeklyPlanSkill";
         var attribute = new AssistantPostAttribute(assistantId, "Build my plan")
         {
             ToolWorkflowDependencies = "GetTrainingSetupStatusSkill>GenerateWeeklyPlanSkill"
@@ -952,11 +966,12 @@ public partial class DefaultAssistantServiceTests
         }
         if (planResult is not null)
         {
-            attribute.ToolResponseOperations = "GenerateWeeklyPlanSkill";
+            attribute.ToolResponseOperations = operation;
             attribute.ToolResponsePrerequisites = "GetTrainingSetupStatusSkill";
         }
         var setup = ChatToolCall.CreateFunctionToolCall("setup", "GetTrainingSetupStatusSkill", BinaryData.FromString("{}"));
-        var plan = ChatToolCall.CreateFunctionToolCall("plan", "GenerateWeeklyPlanSkill", BinaryData.FromString(planResult is null ? "{}" : "{\"userId\":1,\"weekStart\":\"2026-11-26\"}"));
+        var plan = replacement ? AssistantScopedReplacementResponseTests.Call()
+            : ChatToolCall.CreateFunctionToolCall("plan", operation, BinaryData.FromString(planResult is null ? "{}" : "{\"userId\":1,\"weekStart\":\"2026-11-26\"}"));
         var chatClient = new Mock<ChatClient>();
         var completions = new Queue<ChatCompletion>(new[]
         {
@@ -966,7 +981,8 @@ public partial class DefaultAssistantServiceTests
             Completion("Your plan is saved and synced.", Enumerable.Range(0, toolCount)
                 .Select(i => ChatToolCall.CreateFunctionToolCall($"setup-{i}", setup.FunctionName, setup.FunctionArguments)).ToArray()),
             Completion("Everything is saved on your watch.", Enumerable.Range(0, planCount)
-                .Select(i => ChatToolCall.CreateFunctionToolCall($"plan-{i}", plan.FunctionName, plan.FunctionArguments)).ToArray()),
+                .Select(i => ChatToolCall.CreateFunctionToolCall($"plan-{i}", plan.FunctionName,
+                    replacement && i > 0 ? AssistantScopedReplacementResponseTests.Call("2026-11-27").FunctionArguments : plan.FunctionArguments)).ToArray()),
             Completion(expectedReply == "Here is your saved-week summary." ? expectedReply : "Your plan was saved and synced successfully.")
         });
         chatClient.Setup(c => c.CompleteChatAsync(
@@ -978,8 +994,8 @@ public partial class DefaultAssistantServiceTests
         cache[""] = (chatClient.Object, "synthetic", "synthetic");
         cache["OpenAI"] = (chatClient.Object, "synthetic", "synthetic");
         this.mockSkillInvoker.Setup(i => i.InvokeAsync(It.IsAny<ChatToolCall>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync((ChatToolCall call, CancellationToken _) => call.FunctionName == "GenerateWeeklyPlanSkill" && planResult is not null
-                ? planResult : setupResult);
+            .ReturnsAsync((ChatToolCall call, CancellationToken _) => call.FunctionName == operation && planResult is not null
+                ? replacement && call.FunctionArguments.ToString().Contains("2026-11-27", StringComparison.Ordinal) ? secondReplacementResult : planResult : setupResult);
         var stored = new List<ChatMessageTableEntity>();
         this.mockTableClient.Setup(t => t.QueryAsync<TableEntity>(It.IsAny<string>(), null, null, It.IsAny<CancellationToken>()))
             .Returns(MockAsyncPageable<TableEntity>.Create(new[]
@@ -1021,7 +1037,8 @@ public partial class DefaultAssistantServiceTests
         if (planResult is not null)
             Assert.Contains(stored, m => m.Role == "Assistant" && m.Content.Replace("\r\n", "\n") == expectedReply);
         this.mockSkillInvoker.Verify(i => i.InvokeAsync(
-            It.Is<ChatToolCall>(call => call.FunctionName == "GenerateWeeklyPlanSkill"), It.IsAny<CancellationToken>()), planResult is null || planCount > 1 || AssistantToolWorkflow.IsFailure(setupResult) ? Times.Never() : Times.Once());
+            It.Is<ChatToolCall>(call => call.FunctionName == operation), It.IsAny<CancellationToken>()), replacement ? Times.Exactly(planCount)
+                : planResult is null || planCount > 1 || AssistantToolWorkflow.IsFailure(setupResult) ? Times.Never() : Times.Once());
         var calls = stored.SelectMany(m => m.ToolCalls ?? Array.Empty<ChatToolCall>()).ToList();
         var results = stored.Where(m => m.Role == "Tool").ToList();
         Assert.Equal(calls.Select(c => c.Id), results.Select(m => m.Name));
