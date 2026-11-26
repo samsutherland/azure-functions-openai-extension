@@ -181,6 +181,15 @@ internal sealed class AssistantToolResponsePolicy
             }
             messages.Add(message);
         }
+        // A refreshed setup read can retire its earlier tool result while a
+        // dependency-blocked operation remains. Preserve the current question
+        // only after every operation outcome has passed the finite boundary.
+        if (this.contextPrerequisite is not null)
+        {
+            string? question = RenderResult(this.contextPrerequisite);
+            if (question is null) return UnverifiedResponse;
+            messages.Insert(0, question);
+        }
         return string.Join(Environment.NewLine + Environment.NewLine, messages.Distinct());
     }
 

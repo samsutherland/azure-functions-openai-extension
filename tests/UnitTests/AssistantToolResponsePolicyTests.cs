@@ -131,6 +131,21 @@ public class AssistantToolResponsePolicyTests
         Assert.Equal(AssistantToolResponsePolicy.UnverifiedResponse, policy.Render());
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CurrentContextQuestionDoesNotHideUnknownOperationEvidence(bool unknown)
+    {
+        var policy = new AssistantToolResponsePolicy("Write", "GetTrainingSetupStatusSkill");
+        policy.RequireOperationEvidence();
+        policy.ObserveContextPrerequisite(AssistantWorkflowContextTests.Prerequisite(false, "Current question?"));
+        policy.ObserveResults([new(Call(), unknown ? "{}" : "", unknown
+            ? AssistantToolWorkflow.ToolExecutionDisposition.Invoked : AssistantToolWorkflow.ToolExecutionDisposition.DependencyBlocked)]);
+        Assert.Equal(unknown ? AssistantToolResponsePolicy.UnverifiedResponse
+            : "Your saved goal and availability." + Environment.NewLine + Environment.NewLine + "Current question?"
+                + Environment.NewLine + Environment.NewLine + "The requested operation was not attempted. Completion and provider delivery are not confirmed.", policy.Render());
+    }
+
     static AssistantToolResponsePolicy Observe(string result)
     {
         var policy = new AssistantToolResponsePolicy("Write");

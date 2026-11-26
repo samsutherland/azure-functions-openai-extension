@@ -28,27 +28,34 @@ public partial class DefaultAssistantServiceTests
     [InlineData(false, false, false, "missing_setup_advice")]
     [InlineData(false, false, false, "setup_question_refresh_required")]
     [InlineData(false, false, false, "setup_question_update_required")]
+    [InlineData(false, false, false, "setup_dependency_blocked_required")]
     public async Task ContextRefreshesAfterToolsWithoutStoringSnapshotsAndBlocksHiddenCalls(bool failRefresh, bool hidden, bool internalOnly, string evidenceMode)
     {
         const string assistant = "context-test";
+        bool dependencyBlocked = evidenceMode == "setup_dependency_blocked_required";
         bool advice = evidenceMode is "advice" or "missing_setup_advice";
         bool noCalls = evidenceMode is "no_calls_required" or "advice" or "missing_setup_required" or "missing_setup_advice";
         bool readOnly = evidenceMode is "read_only_required" or "setup_question_refresh_required" or "setup_question_update_required";
         var attribute = new AssistantPostAttribute(assistant, "Change my plan")
         {
             WorkflowContextOperation = internalOnly ? null : "Context", WorkflowContextArguments = "secret-header",
-            ToolResponseOperations = "Write;Hidden", ToolResponsePrerequisites = "GetTrainingSetupStatusSkill"
+            ToolWorkflowDependencies = dependencyBlocked ? "GetTrainingSetupStatusSkill>GenerateWeeklyPlanSkill" : null,
+            ToolResponseOperations = "Write;Hidden;GenerateWeeklyPlanSkill", ToolResponsePrerequisites = "GetTrainingSetupStatusSkill"
         };
         typeof(AssistantPostAttribute).GetProperty("ToolInternalOperations")?.SetValue(attribute, "Context");
         int contextCalls = 0, modelCalls = 0;
         var invoked = new List<ChatToolCall>();
-        this.mockSkillInvoker.Setup(i => i.GetFunctionsDefinitions()).Returns(AssistantWorkflowContextTests.Tools());
+        var definitions = AssistantWorkflowContextTests.Tools();
+        definitions.Add(ChatTool.CreateFunctionTool("GetTrainingSetupStatusSkill", "Read setup", BinaryData.FromString("{}")));
+        definitions.Add(ChatTool.CreateFunctionTool("GenerateWeeklyPlanSkill", "Generate plan", BinaryData.FromString("{}")));
+        this.mockSkillInvoker.Setup(i => i.GetFunctionsDefinitions()).Returns(definitions);
         this.mockSkillInvoker.Setup(i => i.InvokeAsync(It.IsAny<ChatToolCall>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync((ChatToolCall call, CancellationToken _) =>
             {
                 if (call.FunctionName != "Context")
                 {
                     invoked.Add(call);
+                    if (call.FunctionName == "GetTrainingSetupStatusSkill") return AssistantWorkflowContextTests.Prerequisite(false, "What is your first name?").ToString();
                     if (call.FunctionName == "Read") return "{\"success\":true,\"data\":[1]}";
                     return "{\"schemaVersion\":1,\"operation\":\"Write\",\"verified\":true,\"persisted\":true,\"success\":true,\"outcome\":\"saved\",\"canTellAthleteSaved\":true}";
                 }
@@ -59,10 +66,12 @@ public partial class DefaultAssistantServiceTests
                 Assert.Equal("Change my plan", input["userMessage"]);
                 if (failRefresh && contextCalls > 1) return "{}";
                 var result = JObject.Parse(AssistantWorkflowContextTests.Result("snapshot-" + contextCalls, readOnly ? "Read" : "Write"));
+                if (dependencyBlocked) result["allowedToolNames"] = new JArray("GetTrainingSetupStatusSkill", "GenerateWeeklyPlanSkill");
                 if (evidenceMode.Length > 0) result["requireOperationEvidence"] = evidenceMode.EndsWith("required", StringComparison.Ordinal)
                     && (evidenceMode != "read_only_required" || contextCalls == 1);
                 result["toolArgumentOverrides"] = new JObject { ["userId"] = 1, ["externalUserId"] = "owner" };
-                if (evidenceMode.StartsWith("missing_setup", StringComparison.Ordinal))
+                if (dependencyBlocked) result["responsePrerequisite"] = AssistantWorkflowContextTests.Prerequisite(false, "What is your first name?");
+                else if (evidenceMode.StartsWith("missing_setup", StringComparison.Ordinal))
                     result["responsePrerequisite"] = AssistantWorkflowContextTests.Prerequisite(false, "What is your goal?");
                 else if (evidenceMode.StartsWith("setup_question_", StringComparison.Ordinal))
                     result["responsePrerequisite"] = AssistantWorkflowContextTests.Prerequisite(
@@ -78,11 +87,14 @@ public partial class DefaultAssistantServiceTests
                 if (internalOnly) Assert.DoesNotContain(options.Tools, t => t.FunctionName == "Context");
                 else
                 {
-                    Assert.Equal(new[] { readOnly ? "Read" : "Write" }, options.Tools.Select(t => t.FunctionName));
+                    Assert.Equal(dependencyBlocked ? new[] { "GetTrainingSetupStatusSkill", "GenerateWeeklyPlanSkill" } : new[] { readOnly ? "Read" : "Write" }, options.Tools.Select(t => t.FunctionName));
                     Assert.Contains(messages, m => m is SystemChatMessage && m.Content.Any(c => c.Text == "snapshot-" + modelCalls));
                 }
                 Assert.DoesNotContain(messages, m => m.Content.Any(c => c.Text?.Contains("secret-header", StringComparison.Ordinal) == true));
-                ChatCompletion response = noCalls ? Completion(advice ? "Keep tomorrow easy and review how you feel." : "Everything is saved on your watch!")
+                ChatCompletion response = dependencyBlocked && modelCalls <= 2 ? Completion("Everything is saved on your watch!",
+                    ChatToolCall.CreateFunctionToolCall("dependency-" + modelCalls, modelCalls == 1 ? "GetTrainingSetupStatusSkill" : "GenerateWeeklyPlanSkill",
+                        BinaryData.FromString("{\"input\":\"{\\\"userId\\\":2}\"}")))
+                    : noCalls ? Completion(advice ? "Keep tomorrow easy and review how you feel." : "Everything is saved on your watch!")
                     : modelCalls == 1 ? Completion("Everything is saved on your watch!",
                     ChatToolCall.CreateFunctionToolCall("write", internalOnly ? "Context" : hidden ? "Hidden" : readOnly ? "Read" : "Write",
                         BinaryData.FromString("{\"input\":\"{\\\"userId\\\":2,\\\"externalUserId\\\":\\\"victim\\\",\\\"date\\\":\\\"2026-11-26\\\"}\"}")))
@@ -109,6 +121,7 @@ public partial class DefaultAssistantServiceTests
         typeof(DefaultAssistantService).GetField("tableClient", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.SetValue(service, this.mockTableClient.Object);
         var state = await service.PostMessageAsync(attribute, CancellationToken.None);
         string expected = advice ? "Keep tomorrow easy and review how you feel."
+            : dependencyBlocked ? "Your saved goal and availability." + Environment.NewLine + Environment.NewLine + "What is your first name?" + Environment.NewLine + Environment.NewLine + "The requested operation was not attempted. Completion and provider delivery are not confirmed."
             : evidenceMode == "missing_setup_required" ? "Your saved goal and availability." + Environment.NewLine + Environment.NewLine + "What is your goal?"
             : evidenceMode == "setup_question_update_required" ? "Your saved goal and availability." + Environment.NewLine + Environment.NewLine + "New question?"
             : evidenceMode is "no_calls_required" or "read_only_required" or "setup_question_refresh_required" ? AssistantToolResponsePolicy.UnverifiedResponse
@@ -118,8 +131,8 @@ public partial class DefaultAssistantServiceTests
         Assert.Contains(stored, m => m.Role == "Assistant" && m.Content == expected);
         Assert.All(stored.Where(m => m.Role == "Assistant"), m => Assert.DoesNotContain("on your watch", m.Content));
         Assert.DoesNotContain(stored, m => m.Content.Contains("snapshot-", StringComparison.Ordinal) || m.Content.Contains("secret-header", StringComparison.Ordinal));
-        Assert.Equal(internalOnly ? 0 : hidden || noCalls ? 1 : 2, contextCalls);
-        Assert.Equal(internalOnly || hidden || failRefresh || noCalls ? 1 : 2, modelCalls);
+        Assert.Equal(internalOnly ? 0 : dependencyBlocked ? 3 : hidden || noCalls ? 1 : 2, contextCalls);
+        Assert.Equal(dependencyBlocked ? 3 : internalOnly || hidden || failRefresh || noCalls ? 1 : 2, modelCalls);
         Assert.Equal(internalOnly || hidden || noCalls ? 0 : 1, invoked.Count);
         if (!hidden && !internalOnly && !noCalls)
         {
@@ -129,11 +142,19 @@ public partial class DefaultAssistantServiceTests
         var calls = stored.SelectMany(m => m.ToolCalls ?? Array.Empty<ChatToolCall>()).ToList();
         Assert.Equal(calls.Select(c => c.Id), stored.Where(m => m.Role == "Tool").Select(m => m.Name));
         if (!internalOnly) Assert.DoesNotContain(calls, c => c.FunctionName == "Context");
-        if (!hidden && !internalOnly && !noCalls) Assert.Equal(invoked.Single().FunctionArguments.ToString(), calls.Single().FunctionArguments.ToString());
+        if (!hidden && !internalOnly && !noCalls) Assert.Equal(invoked.Single().FunctionArguments.ToString(), calls.First().FunctionArguments.ToString());
+        var responseTelemetry = this.mockLogger.Invocations.Where(i => i.Method.Name == "Log").Select(i => i.Arguments[2]?.ToString() ?? "")
+            .Where(message => message.StartsWith("Workflow response", StringComparison.Ordinal)).ToList();
+        bool expectsFinitePolicy = !advice && !hidden && !internalOnly && !failRefresh;
+        if (expectsFinitePolicy) Assert.Contains(responseTelemetry, message => message.Contains("policyVersion=workflow-response-v1", StringComparison.Ordinal)
+            && message.Contains(expected == AssistantToolResponsePolicy.UnverifiedResponse ? "outcome=unverified" : "outcome=finite", StringComparison.Ordinal)
+            && message.Contains("active=True", StringComparison.Ordinal));
+        else Assert.Empty(responseTelemetry);
+        Assert.All(responseTelemetry, message => { Assert.DoesNotContain("secret-header", message); Assert.DoesNotContain("snapshot-", message); Assert.DoesNotContain("question", message); });
         var telemetry = this.mockLogger.Invocations.Where(i => i.Method.Name == "Log").Select(i => i.Arguments[2]?.ToString() ?? "")
             .Where(message => message.StartsWith("Workflow context", StringComparison.Ordinal)).ToList();
         if (!internalOnly) Assert.Contains(telemetry, message => message.Contains("policyVersion=workflow-context-v1", StringComparison.Ordinal)
-            && message.Contains("selectedToolCount=1", StringComparison.Ordinal) && message.Contains("latencyMs=", StringComparison.Ordinal));
+            && message.Contains(dependencyBlocked ? "selectedToolCount=2" : "selectedToolCount=1", StringComparison.Ordinal) && message.Contains("latencyMs=", StringComparison.Ordinal));
         Assert.All(telemetry, message => { Assert.DoesNotContain("secret-header", message); Assert.DoesNotContain("snapshot-", message); });
     }
 

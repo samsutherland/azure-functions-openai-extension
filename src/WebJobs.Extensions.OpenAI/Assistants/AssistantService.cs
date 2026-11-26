@@ -400,7 +400,7 @@ class DefaultAssistantService : IAssistantService
             }
 
             string replyMessage = responsePolicy.IsActive
-                ? functionCalls.Count == 0 ? responsePolicy.Render() : string.Empty
+                ? functionCalls.Count == 0 ? this.RenderFiniteResponse(responsePolicy) : string.Empty
                 : this.FormatReplyMessage(response);
             if (!string.IsNullOrWhiteSpace(replyMessage) || functionCalls.Count > 0)
             {
@@ -425,6 +425,14 @@ class DefaultAssistantService : IAssistantService
             if (responsePolicy.IsActive)
                 ClearTurnModelProse();
         }
+    }
+
+    string RenderFiniteResponse(AssistantToolResponsePolicy policy)
+    {
+        string reply = policy.Render();
+        this.logger.LogInformation("Workflow response policyVersion={PolicyVersion} outcome={Outcome} active={Active}",
+            "workflow-response-v1", reply == AssistantToolResponsePolicy.UnverifiedResponse ? "unverified" : "finite", policy.IsActive);
+        return reply;
     }
 
     async Task<AssistantWorkflowContext?> LoadWorkflowContextAsync(AssistantPostAttribute attribute,
