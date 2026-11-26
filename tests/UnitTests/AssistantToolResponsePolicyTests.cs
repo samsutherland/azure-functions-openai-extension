@@ -106,6 +106,31 @@ public class AssistantToolResponsePolicyTests
         Assert.Equal("Saved goal and schedule" + Environment.NewLine + Environment.NewLine + "Does that feel right?", Observe(result).Render());
     }
 
+    [Fact]
+    public void ContextQuestionRequiresConfiguredPrerequisiteAndActiveProofPolicy()
+    {
+        var read = AssistantWorkflowContextTests.Prerequisite(false, "Current question?");
+        var unconfigured = new AssistantToolResponsePolicy(null);
+        unconfigured.RequireOperationEvidence(); unconfigured.ObserveContextPrerequisite(read);
+        Assert.Equal(AssistantToolResponsePolicy.UnverifiedResponse, unconfigured.Render());
+        var configured = new AssistantToolResponsePolicy(null, "GetTrainingSetupStatusSkill");
+        configured.ObserveContextPrerequisite(read);
+        Assert.False(configured.IsActive);
+        configured.RequireOperationEvidence();
+        Assert.Contains("Current question?", configured.Render());
+    }
+
+    [Fact]
+    public void FreshReadyContextRetiresTheSameActorsEarlierVerifiedSetupQuestion()
+    {
+        var policy = new AssistantToolResponsePolicy(null, "GetTrainingSetupStatusSkill");
+        var call = ChatToolCall.CreateFunctionToolCall("setup", "GetTrainingSetupStatusSkill", BinaryData.FromString("{\"userId\":1}"));
+        policy.ObserveResults([new(call, AssistantWorkflowContextTests.Prerequisite(false, "Old question?").ToString(), AssistantToolWorkflow.ToolExecutionDisposition.Invoked)]);
+        Assert.Contains("Old question?", policy.Render());
+        policy.ObserveContextPrerequisite(AssistantWorkflowContextTests.Prerequisite(true, ""));
+        Assert.Equal(AssistantToolResponsePolicy.UnverifiedResponse, policy.Render());
+    }
+
     static AssistantToolResponsePolicy Observe(string result)
     {
         var policy = new AssistantToolResponsePolicy("Write");

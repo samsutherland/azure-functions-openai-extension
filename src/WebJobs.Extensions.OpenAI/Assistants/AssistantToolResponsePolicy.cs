@@ -17,6 +17,7 @@ internal sealed class AssistantToolResponsePolicy
     readonly HashSet<string> prerequisites;
     readonly List<AssistantToolWorkflow.ToolExecution> results = new();
     readonly List<ChatToolCall> unexecutedScopedCalls = new();
+    AssistantToolWorkflow.ToolExecution? contextPrerequisite;
 
     internal AssistantToolResponsePolicy(string? operationNames, string? prerequisiteNames = null)
     {
@@ -33,6 +34,22 @@ internal sealed class AssistantToolResponsePolicy
     // avoids making a sensitive call. Once active, this remains sticky for the turn.
     internal void RequireOperationEvidence() => this.IsActive = true;
     bool hasUnexecutedSensitiveCalls;
+
+    // Current context may supply a verified application question without a model
+    // tool call. Keep this separate from execution/dependency state and tool history.
+    internal void ObserveContextPrerequisite(JObject? result)
+    {
+        this.contextPrerequisite = null;
+        string? operation = result?["operation"]?.Type == JTokenType.String ? result["operation"]!.Value<string>() : null;
+        if (result is null || operation is null || !this.prerequisites.Contains(operation)) return;
+        var call = ChatToolCall.CreateFunctionToolCall("context-prerequisite", operation,
+            BinaryData.FromString(new JObject { ["userId"] = result["actorId"]?.DeepClone() }.ToString()));
+        var execution = new AssistantToolWorkflow.ToolExecution(call, result.ToString(), AssistantToolWorkflow.ToolExecutionDisposition.Invoked);
+        if (ParseVerifiedResult(execution) is null) return;
+        this.results.RemoveAll(prior => prior.Call.FunctionName == operation
+            && JToken.DeepEquals(ParseVerifiedResult(prior)?["actorId"], result["actorId"]));
+        if (!IsVerifiedReady(execution)) this.contextPrerequisite = execution;
+    }
 
     internal void ObserveCalls(IEnumerable<ChatToolCall> calls) =>
         this.IsActive |= calls.Any(call => this.operations.Contains(call.FunctionName));
@@ -76,10 +93,9 @@ internal sealed class AssistantToolResponsePolicy
 
     internal string Render()
     {
-        if ((this.results.Count == 0 && this.unexecutedScopedCalls.Count == 0) || this.hasUnexecutedSensitiveCalls)
-        {
-            return UnverifiedResponse;
-        }
+        if (this.hasUnexecutedSensitiveCalls) return UnverifiedResponse;
+        if (this.results.Count == 0 && this.unexecutedScopedCalls.Count == 0)
+            return this.contextPrerequisite is null ? UnverifiedResponse : RenderResult(this.contextPrerequisite) ?? UnverifiedResponse;
 
         var messages = new List<string>();
         var planRevisions = new Dictionary<string, string>();

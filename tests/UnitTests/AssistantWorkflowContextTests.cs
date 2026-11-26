@@ -112,6 +112,30 @@ public class AssistantWorkflowContextTests
         Assert.Null(await AssistantWorkflowContext.LoadAsync(invoker.Object, "Context", "opaque", "assistant", Tools(), CancellationToken.None));
     }
 
+    [Theory]
+    [InlineData("actorId", "2")]
+    [InlineData("schemaVersion", "2")]
+    [InlineData("operation", "\"Other\"")]
+    [InlineData("verified", "false")]
+    [InlineData("ready", "true")]
+    [InlineData("nextQuestion", "1")]
+    public async Task MalformedOrOtherActorPrerequisiteRejectsContext(string property, string value)
+    {
+        var result = JObject.Parse(Result()); result["toolArgumentOverrides"] = new JObject { ["userId"] = 1 };
+        var read = Prerequisite(false, "Current question?"); read[property] = JToken.Parse(value);
+        result["responsePrerequisite"] = read;
+        var invoker = new Mock<IAssistantSkillInvoker>();
+        invoker.Setup(i => i.InvokeAsync(It.IsAny<ChatToolCall>(), It.IsAny<CancellationToken>())).ReturnsAsync(result.ToString());
+        Assert.Null(await AssistantWorkflowContext.LoadAsync(invoker.Object, "Context", "opaque", "assistant", Tools(), CancellationToken.None));
+    }
+
+    internal static JObject Prerequisite(bool ready, string question) => JObject.FromObject(new
+    {
+        schemaVersion = 1, operation = "GetTrainingSetupStatusSkill", actorId = 1, verified = true,
+        success = ready, ready, outcome = ready ? "ready" : "needs_user_input",
+        nextQuestion = ready ? null : question, promptContext = ready ? null : "Your saved goal and availability."
+    });
+
     internal static IList<ChatTool> Tools() => new List<ChatTool>
     {
         ChatTool.CreateFunctionTool("Context", "Read context", BinaryData.FromString("{}")),

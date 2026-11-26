@@ -24,15 +24,20 @@ public partial class DefaultAssistantServiceTests
     [InlineData(false, false, false, "read_only_required")]
     [InlineData(false, false, false, "write_required")]
     [InlineData(false, false, false, "advice")]
+    [InlineData(false, false, false, "missing_setup_required")]
+    [InlineData(false, false, false, "missing_setup_advice")]
+    [InlineData(false, false, false, "setup_question_refresh_required")]
+    [InlineData(false, false, false, "setup_question_update_required")]
     public async Task ContextRefreshesAfterToolsWithoutStoringSnapshotsAndBlocksHiddenCalls(bool failRefresh, bool hidden, bool internalOnly, string evidenceMode)
     {
         const string assistant = "context-test";
-        bool noCalls = evidenceMode is "no_calls_required" or "advice";
-        bool readOnly = evidenceMode == "read_only_required";
+        bool advice = evidenceMode is "advice" or "missing_setup_advice";
+        bool noCalls = evidenceMode is "no_calls_required" or "advice" or "missing_setup_required" or "missing_setup_advice";
+        bool readOnly = evidenceMode is "read_only_required" or "setup_question_refresh_required" or "setup_question_update_required";
         var attribute = new AssistantPostAttribute(assistant, "Change my plan")
         {
             WorkflowContextOperation = internalOnly ? null : "Context", WorkflowContextArguments = "secret-header",
-            ToolResponseOperations = "Write;Hidden"
+            ToolResponseOperations = "Write;Hidden", ToolResponsePrerequisites = "GetTrainingSetupStatusSkill"
         };
         typeof(AssistantPostAttribute).GetProperty("ToolInternalOperations")?.SetValue(attribute, "Context");
         int contextCalls = 0, modelCalls = 0;
@@ -57,6 +62,12 @@ public partial class DefaultAssistantServiceTests
                 if (evidenceMode.Length > 0) result["requireOperationEvidence"] = evidenceMode.EndsWith("required", StringComparison.Ordinal)
                     && (evidenceMode != "read_only_required" || contextCalls == 1);
                 result["toolArgumentOverrides"] = new JObject { ["userId"] = 1, ["externalUserId"] = "owner" };
+                if (evidenceMode.StartsWith("missing_setup", StringComparison.Ordinal))
+                    result["responsePrerequisite"] = AssistantWorkflowContextTests.Prerequisite(false, "What is your goal?");
+                else if (evidenceMode.StartsWith("setup_question_", StringComparison.Ordinal))
+                    result["responsePrerequisite"] = AssistantWorkflowContextTests.Prerequisite(
+                        evidenceMode == "setup_question_refresh_required" && contextCalls > 1,
+                        contextCalls == 1 ? "Old question?" : "New question?");
                 return result.ToString();
             });
         var chatClient = new Mock<ChatClient>();
@@ -71,7 +82,7 @@ public partial class DefaultAssistantServiceTests
                     Assert.Contains(messages, m => m is SystemChatMessage && m.Content.Any(c => c.Text == "snapshot-" + modelCalls));
                 }
                 Assert.DoesNotContain(messages, m => m.Content.Any(c => c.Text?.Contains("secret-header", StringComparison.Ordinal) == true));
-                ChatCompletion response = noCalls ? Completion(evidenceMode == "advice" ? "Keep tomorrow easy and review how you feel." : "Everything is saved on your watch!")
+                ChatCompletion response = noCalls ? Completion(advice ? "Keep tomorrow easy and review how you feel." : "Everything is saved on your watch!")
                     : modelCalls == 1 ? Completion("Everything is saved on your watch!",
                     ChatToolCall.CreateFunctionToolCall("write", internalOnly ? "Context" : hidden ? "Hidden" : readOnly ? "Read" : "Write",
                         BinaryData.FromString("{\"input\":\"{\\\"userId\\\":2,\\\"externalUserId\\\":\\\"victim\\\",\\\"date\\\":\\\"2026-11-26\\\"}\"}")))
@@ -97,8 +108,10 @@ public partial class DefaultAssistantServiceTests
             this.mockSkillInvoker.Object, this.mockLoggerFactory.Object);
         typeof(DefaultAssistantService).GetField("tableClient", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.SetValue(service, this.mockTableClient.Object);
         var state = await service.PostMessageAsync(attribute, CancellationToken.None);
-        string expected = evidenceMode == "advice" ? "Keep tomorrow easy and review how you feel."
-            : evidenceMode is "no_calls_required" or "read_only_required" ? AssistantToolResponsePolicy.UnverifiedResponse
+        string expected = advice ? "Keep tomorrow easy and review how you feel."
+            : evidenceMode == "missing_setup_required" ? "Your saved goal and availability." + Environment.NewLine + Environment.NewLine + "What is your goal?"
+            : evidenceMode == "setup_question_update_required" ? "Your saved goal and availability." + Environment.NewLine + Environment.NewLine + "New question?"
+            : evidenceMode is "no_calls_required" or "read_only_required" or "setup_question_refresh_required" ? AssistantToolResponsePolicy.UnverifiedResponse
             : hidden || internalOnly ? AssistantWorkflowContext.BlockedResponse : failRefresh ? AssistantWorkflowContext.UnavailableResponse
             : "Your change was saved and verified in the app. Device delivery is not confirmed.";
         Assert.Contains(state.RecentMessages, m => m.Content == expected);

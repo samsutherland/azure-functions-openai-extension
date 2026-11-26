@@ -10,7 +10,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.OpenAI.Assistants;
 
 // The configured context operation owns authentication, authorization and snapshot
 // freshness. Its opaque request context is used only for the internal invocation.
-internal sealed record AssistantWorkflowContext(string Instructions, IList<ChatTool> AllowedTools, JObject? ArgumentOverrides, bool RequireOperationEvidence)
+internal sealed record AssistantWorkflowContext(string Instructions, IList<ChatTool> AllowedTools, JObject? ArgumentOverrides, bool RequireOperationEvidence, JObject? ResponsePrerequisite)
 {
     internal const string UnavailableResponse = "I couldn't verify the current workflow context. Please try again; completion and provider delivery are not confirmed.";
     internal const string BlockedResponse = "A requested tool is unavailable for the current workflow. Completion and provider delivery are not confirmed.";
@@ -52,7 +52,23 @@ internal sealed record AssistantWorkflowContext(string Instructions, IList<ChatT
                 return null;
             overrides = (JObject)values.DeepClone();
         }
-        return new(result["instructions"]!.Value<string>()!, registered.Where(t => names.Any(n => n.Value<string>() == t.FunctionName)).ToList(), overrides, True(result["requireOperationEvidence"]));
+        JObject? prerequisite = null;
+        if (result["responsePrerequisite"] is JToken prerequisiteToken && prerequisiteToken.Type != JTokenType.Null)
+        {
+            if (prerequisiteToken is not JObject read || read.ToString(Formatting.None).Length > 16384
+                || read["schemaVersion"]?.Type != JTokenType.Integer || read["schemaVersion"]!.ToString() != "1"
+                || read["operation"]?.Type != JTokenType.String || read["operation"]!.Value<string>() != "GetTrainingSetupStatusSkill"
+                || !True(read["verified"]) || read["actorId"]?.Type != JTokenType.Integer
+                || overrides?["userId"] is null || !JToken.DeepEquals(read["actorId"], overrides["userId"])
+                || read["ready"]?.Type != JTokenType.Boolean || read["success"]?.Type != JTokenType.Boolean
+                || True(read["ready"]) != True(read["success"])
+                || read["outcome"]?.Type != JTokenType.String || read["outcome"]!.Value<string>() != (True(read["ready"]) ? "ready" : "needs_user_input")
+                || !ValidOptionalText(read["nextQuestion"], 2048) || !ValidOptionalText(read["promptContext"], 8192)
+                || !True(read["ready"]) && string.IsNullOrWhiteSpace(read["nextQuestion"]?.Value<string>())
+                || True(read["ready"]) && !string.IsNullOrWhiteSpace(read["nextQuestion"]?.Value<string>())) return null;
+            prerequisite = (JObject)read.DeepClone();
+        }
+        return new(result["instructions"]!.Value<string>()!, registered.Where(t => names.Any(n => n.Value<string>() == t.FunctionName)).ToList(), overrides, True(result["requireOperationEvidence"]), prerequisite);
     }
 
     internal ChatToolCall? Canonicalize(ChatToolCall call)
@@ -80,6 +96,8 @@ internal sealed record AssistantWorkflowContext(string Instructions, IList<ChatT
     }
 
     internal bool Allows(ChatToolCall call) => this.AllowedTools.Any(t => t.FunctionName == call.FunctionName) && this.Canonicalize(call) is not null;
+    static bool ValidOptionalText(JToken? token, int limit) => token is null || token.Type == JTokenType.Null
+        || token.Type == JTokenType.String && token.Value<string>()!.Length <= limit;
     static bool Name(string? name) => name is not null && Regex.IsMatch(name, @"\A[A-Za-z0-9_-]{1,64}\z");
     static bool True(JToken? token) => token?.Type == JTokenType.Boolean && token.Value<bool>();
 }
