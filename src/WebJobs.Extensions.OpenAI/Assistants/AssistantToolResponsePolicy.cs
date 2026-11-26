@@ -28,6 +28,10 @@ internal sealed class AssistantToolResponsePolicy
         .Select(name => name.Trim()).Where(name => name.Length > 0), StringComparer.OrdinalIgnoreCase);
 
     internal bool IsActive { get; private set; }
+
+    // Application-selected status workflows require proof even if the model
+    // avoids making a sensitive call. Once active, this remains sticky for the turn.
+    internal void RequireOperationEvidence() => this.IsActive = true;
     bool hasUnexecutedSensitiveCalls;
 
     internal void ObserveCalls(IEnumerable<ChatToolCall> calls) =>

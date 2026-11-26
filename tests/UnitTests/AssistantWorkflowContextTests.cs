@@ -29,6 +29,15 @@ public class AssistantWorkflowContextTests
     }
 
     [Fact]
+    public async Task MalformedOperationEvidencePolicyFailsClosed()
+    {
+        var result = JObject.Parse(Result()); result["requireOperationEvidence"] = "true";
+        var invoker = new Mock<IAssistantSkillInvoker>();
+        invoker.Setup(i => i.InvokeAsync(It.IsAny<ChatToolCall>(), It.IsAny<CancellationToken>())).ReturnsAsync(result.ToString());
+        Assert.Null(await AssistantWorkflowContext.LoadAsync(invoker.Object, "Context", "opaque", "assistant", Tools(), CancellationToken.None));
+    }
+
+    [Fact]
     public async Task SnapshotArgumentsEncodeOpaqueIdentityWithoutUsingItAsJson()
     {
         const string opaque = "header-with-\\\"quotes\\\"";
