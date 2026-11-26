@@ -26,13 +26,17 @@ internal sealed class AssistantToolResponsePolicy
         .Select(name => name.Trim()).Where(name => name.Length > 0), StringComparer.OrdinalIgnoreCase);
 
     internal bool IsActive { get; private set; }
+    bool hasUnexecutedSensitiveCalls;
 
     internal void ObserveCalls(IEnumerable<ChatToolCall> calls) =>
         this.IsActive |= calls.Any(call => this.operations.Contains(call.FunctionName));
 
-    internal void ObserveUnexecutedCalls(IEnumerable<ChatToolCall> calls) =>
-        this.IsActive |= calls.Any(call => this.operations.Contains(call.FunctionName)
+    internal void ObserveUnexecutedCalls(IEnumerable<ChatToolCall> calls)
+    {
+        this.hasUnexecutedSensitiveCalls |= calls.Any(call => this.operations.Contains(call.FunctionName)
             || this.prerequisites.Contains(call.FunctionName));
+        this.IsActive |= this.hasUnexecutedSensitiveCalls;
+    }
 
     internal void ObserveResults(IEnumerable<AssistantToolWorkflow.ToolExecution> executions)
     {
@@ -60,14 +64,24 @@ internal sealed class AssistantToolResponsePolicy
 
     internal string Render()
     {
-        if (this.results.Count == 0)
+        if (this.results.Count == 0 || this.hasUnexecutedSensitiveCalls)
         {
             return UnverifiedResponse;
         }
 
         var messages = new List<string>();
+        var planRevisions = new Dictionary<string, string>();
         foreach (AssistantToolWorkflow.ToolExecution execution in this.results)
         {
+            JObject? evidence = ParseVerifiedResult(execution);
+            if (evidence?["weeklyPlanId"] is not null)
+            {
+                string scope = evidence["actorId"] + ":" + evidence["weeklyPlanId"];
+                string revision = evidence["revision"]?.ToString() ?? "";
+                if (planRevisions.TryGetValue(scope, out string? previous) && previous != revision)
+                    return UnverifiedResponse;
+                planRevisions[scope] = revision;
+            }
             string? message = RenderResult(execution);
             if (message is null)
             {
@@ -87,6 +101,8 @@ internal sealed class AssistantToolResponsePolicy
             return null;
         bool success = result["success"]?.Type == JTokenType.Boolean && result["success"]!.Value<bool>();
         string? outcome = result["outcome"]?.Type == JTokenType.String ? result["outcome"]!.Value<string>() : null;
+        if (outcome is "generated" or "regenerated" or "reused_existing" or "needs_reconciliation")
+            return AssistantScopedPlanResponse.Render(result, execution.Call);
         if (success && outcome == "ready")
         {
             return "Your saved setup is ready.";
