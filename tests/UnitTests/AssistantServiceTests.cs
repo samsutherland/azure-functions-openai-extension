@@ -908,6 +908,14 @@ public partial class DefaultAssistantServiceTests
         yield return new object[] { AssistantScopedPlanResponseTests.Result().ToString(), AssistantToolResponsePolicy.UnverifiedResponse, 60 };
     }
 
+    [Fact]
+    public async Task PostMessageAsync_BlockedPlanningPreservesTheSetupQuestion()
+    {
+        const string setup = "{\"schemaVersion\":1,\"operation\":\"GetTrainingSetupStatusSkill\",\"success\":false,\"verified\":true,\"outcome\":\"needs_user_input\",\"nextQuestion\":\"What is your goal?\"}";
+        await PostMessageAsync_EvidencePolicySuppressesFalseClaimsInStoredAndReturnedMessages(setup, 1,
+            expectedReply: "What is your goal?\n\nThe requested operation was not attempted. Completion and provider delivery are not confirmed.", planResult: "{}");
+    }
+
     [Theory]
     [MemberData(nameof(WeeklyPlanReplies))]
     public async Task PostMessageAsync_WeeklyEvidenceSuppressesContradictoryProseAndPreservesPairs(string planResult, string expected, int planCount)
@@ -943,7 +951,10 @@ public partial class DefaultAssistantServiceTests
                 attribute, prerequisiteOnly ? "GetTrainingSetupStatusSkill" : "GetTrainingSetupStatusSkill;GenerateWeeklyPlanSkill");
         }
         if (planResult is not null)
+        {
             attribute.ToolResponseOperations = "GenerateWeeklyPlanSkill";
+            attribute.ToolResponsePrerequisites = "GetTrainingSetupStatusSkill";
+        }
         var setup = ChatToolCall.CreateFunctionToolCall("setup", "GetTrainingSetupStatusSkill", BinaryData.FromString("{}"));
         var plan = ChatToolCall.CreateFunctionToolCall("plan", "GenerateWeeklyPlanSkill", BinaryData.FromString(planResult is null ? "{}" : "{\"userId\":1,\"weekStart\":\"2026-11-26\"}"));
         var chatClient = new Mock<ChatClient>();
@@ -1010,7 +1021,7 @@ public partial class DefaultAssistantServiceTests
         if (planResult is not null)
             Assert.Contains(stored, m => m.Role == "Assistant" && m.Content.Replace("\r\n", "\n") == expectedReply);
         this.mockSkillInvoker.Verify(i => i.InvokeAsync(
-            It.Is<ChatToolCall>(call => call.FunctionName == "GenerateWeeklyPlanSkill"), It.IsAny<CancellationToken>()), planResult is null || planCount > 1 ? Times.Never() : Times.Once());
+            It.Is<ChatToolCall>(call => call.FunctionName == "GenerateWeeklyPlanSkill"), It.IsAny<CancellationToken>()), planResult is null || planCount > 1 || AssistantToolWorkflow.IsFailure(setupResult) ? Times.Never() : Times.Once());
         var calls = stored.SelectMany(m => m.ToolCalls ?? Array.Empty<ChatToolCall>()).ToList();
         var results = stored.Where(m => m.Role == "Tool").ToList();
         Assert.Equal(calls.Select(c => c.Id), results.Select(m => m.Name));

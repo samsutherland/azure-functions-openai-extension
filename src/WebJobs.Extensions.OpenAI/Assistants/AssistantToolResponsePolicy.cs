@@ -96,6 +96,10 @@ internal sealed class AssistantToolResponsePolicy
 
     static string? RenderResult(AssistantToolWorkflow.ToolExecution execution)
     {
+        // Runtime disposition proves this attempt had no side effects. Preserve a
+        // verified prerequisite question alongside it; invoked/unknown results still fail closed.
+        if (execution.Disposition == AssistantToolWorkflow.ToolExecutionDisposition.DependencyBlocked)
+            return "The requested operation was not attempted. Completion and provider delivery are not confirmed.";
         JObject? result = ParseVerifiedResult(execution);
         if (result is null)
             return null;
