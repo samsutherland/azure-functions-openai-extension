@@ -19,6 +19,9 @@ internal sealed class AssistantToolResponsePolicy
     readonly List<ChatToolCall> unexecutedScopedCalls = new();
     AssistantToolWorkflow.ToolExecution? contextPrerequisite;
     AssistantToolWorkflow.ToolExecution? contextConflict;
+    JObject? contextDetails;
+    bool requiresDetailsEvidence;
+    bool requiresOperationEvidence;
 
     internal AssistantToolResponsePolicy(string? operationNames, string? prerequisiteNames = null)
     {
@@ -33,7 +36,14 @@ internal sealed class AssistantToolResponsePolicy
 
     // Application-selected status workflows require proof even if the model
     // avoids making a sensitive call. Once active, this remains sticky for the turn.
-    internal void RequireOperationEvidence() => this.IsActive = true;
+    internal void RequireOperationEvidence() { this.IsActive = true; this.requiresOperationEvidence = true; }
+
+    internal void ObserveContextDetails(bool required, JObject? details)
+    {
+        this.requiresDetailsEvidence |= required;
+        this.IsActive |= required;
+        this.contextDetails = details;
+    }
     bool hasUnexecutedSensitiveCalls;
 
     // Current context may supply a verified application question without a model
@@ -98,6 +108,12 @@ internal sealed class AssistantToolResponsePolicy
     internal string Render()
     {
         if (this.hasUnexecutedSensitiveCalls) return UnverifiedResponse;
+        // Narrow saved-detail reads have their own typed proof. A setup question
+        // does not block reading an existing workout. Status requests and any
+        // attempted configured mutation retain their existing outcome boundary.
+        if (this.requiresDetailsEvidence && !this.requiresOperationEvidence
+            && !this.results.Any(e => this.operations.Contains(e.Call.FunctionName)) && this.unexecutedScopedCalls.Count == 0)
+            return AssistantSavedWorkoutDetailsResponse.Render(this.contextDetails);
         if (this.results.Count == 0 && this.unexecutedScopedCalls.Count == 0 && this.contextConflict is null)
             return this.contextPrerequisite is null ? UnverifiedResponse : RenderResult(this.contextPrerequisite) ?? UnverifiedResponse;
 

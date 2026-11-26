@@ -372,6 +372,8 @@ class DefaultAssistantService : IAssistantService
             {
                 responsePolicy.ObserveContextPrerequisite(context.ResponsePrerequisite);
                 responsePolicy.ObserveContextConflict(context.ResponseConflict);
+                responsePolicy.ObserveContextDetails(context.RequireDetailsEvidence, context.ResponseDetails);
+                if (responsePolicy.IsActive) ClearTurnModelProse();
             }
             if (context is not null && (context.Instructions.Length + ApproximateCharsPerToken - 1) / ApproximateCharsPerToken + MessageTokenOverhead
                 >= this.GetMaxContextTokens() - ReservedForResponseTokens - ReservedForFunctionTokens)
@@ -445,9 +447,9 @@ class DefaultAssistantService : IAssistantService
         var started = System.Diagnostics.Stopwatch.StartNew();
         AssistantWorkflowContext? context = await AssistantWorkflowContext.LoadAsync(this.skillInvoker, attribute.WorkflowContextOperation,
             attribute.WorkflowContextArguments, attribute.Id, functions, cancellationToken, attribute.UserMessage);
-        this.logger.LogInformation("Workflow context policyVersion={PolicyVersion} available={Available} selectedToolCount={SelectedToolCount} instructionChars={InstructionChars} estimatedInstructionTokens={EstimatedInstructionTokens} requireOperationEvidence={RequireOperationEvidence} latencyMs={LatencyMs}",
+        this.logger.LogInformation("Workflow context policyVersion={PolicyVersion} available={Available} selectedToolCount={SelectedToolCount} instructionChars={InstructionChars} estimatedInstructionTokens={EstimatedInstructionTokens} requireOperationEvidence={RequireOperationEvidence} requireDetailsEvidence={RequireDetailsEvidence} latencyMs={LatencyMs}",
             "workflow-context-v1", context is not null, context?.AllowedTools.Count ?? 0, context?.Instructions.Length ?? 0,
-            context is null ? 0 : (context.Instructions.Length + ApproximateCharsPerToken - 1) / ApproximateCharsPerToken, context?.RequireOperationEvidence ?? false, started.Elapsed.TotalMilliseconds);
+            context is null ? 0 : (context.Instructions.Length + ApproximateCharsPerToken - 1) / ApproximateCharsPerToken, context?.RequireOperationEvidence ?? false, context?.RequireDetailsEvidence ?? false, started.Elapsed.TotalMilliseconds);
         if (context is null)
             this.logger.LogWarning("Workflow context policyVersion={PolicyVersion} fallback={Fallback}", "workflow-context-v1", "context_unavailable");
         return context;

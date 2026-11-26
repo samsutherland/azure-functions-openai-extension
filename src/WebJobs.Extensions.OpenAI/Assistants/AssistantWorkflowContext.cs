@@ -10,7 +10,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.OpenAI.Assistants;
 
 // The configured context operation owns authentication, authorization and snapshot
 // freshness. Its opaque request context is used only for the internal invocation.
-internal sealed record AssistantWorkflowContext(string Instructions, IList<ChatTool> AllowedTools, JObject? ArgumentOverrides, bool RequireOperationEvidence, JObject? ResponsePrerequisite, AssistantToolWorkflow.ToolExecution? ResponseConflict)
+internal sealed record AssistantWorkflowContext(string Instructions, IList<ChatTool> AllowedTools, JObject? ArgumentOverrides, bool RequireOperationEvidence, JObject? ResponsePrerequisite, AssistantToolWorkflow.ToolExecution? ResponseConflict, bool RequireDetailsEvidence, JObject? ResponseDetails)
 {
     internal const string UnavailableResponse = "I couldn't verify the current workflow context. Please try again; completion and provider delivery are not confirmed.";
     internal const string BlockedResponse = "A requested tool is unavailable for the current workflow. Completion and provider delivery are not confirmed.";
@@ -36,6 +36,7 @@ internal sealed record AssistantWorkflowContext(string Instructions, IList<ChatT
             || result["operation"]?.Type != JTokenType.String || result["operation"]!.Value<string>() != operation
             || !True(result["success"]) || !True(result["verified"])
             || result["requireOperationEvidence"] is JToken evidencePolicy && evidencePolicy.Type != JTokenType.Boolean
+            || result["requireDetailsEvidence"] is JToken detailsPolicy && detailsPolicy.Type != JTokenType.Boolean
             || result["instructions"]?.Type != JTokenType.String || string.IsNullOrWhiteSpace(result["instructions"]!.Value<string>())
             || result["instructions"]!.Value<string>()!.Length > 16384
             || result["allowedToolNames"] is not JArray names || names.Count > 128
@@ -75,7 +76,12 @@ internal sealed record AssistantWorkflowContext(string Instructions, IList<ChatT
                 || overrides?["userId"] is null
                 || (conflict = AssistantScopedConflictResponse.ContextEvidence(rejection, overrides["userId"]!)) is null) return null;
         }
-        return new(result["instructions"]!.Value<string>()!, registered.Where(t => names.Any(n => n.Value<string>() == t.FunctionName)).ToList(), overrides, True(result["requireOperationEvidence"]), prerequisite, conflict);
+        JObject? details = null;
+        if (result["responseDetails"] is JToken detailsToken && detailsToken.Type != JTokenType.Null)
+        {
+            if (detailsToken is not JObject facts || (details = AssistantSavedWorkoutDetailsResponse.Validate(facts, overrides?["userId"])) is null) return null;
+        }
+        return new(result["instructions"]!.Value<string>()!, registered.Where(t => names.Any(n => n.Value<string>() == t.FunctionName)).ToList(), overrides, True(result["requireOperationEvidence"]), prerequisite, conflict, True(result["requireDetailsEvidence"]), details);
     }
 
     internal ChatToolCall? Canonicalize(ChatToolCall call)
