@@ -62,7 +62,7 @@ public sealed class AssistantPostAttribute : AssistantBaseAttribute
     /// Opaque server-bound request context for the internal context operation. Never
     /// populated from model arguments, exposed to the model or stored in chat history.
     /// </summary>
-    [AutoResolve]
+    [AutoResolve(ResolutionPolicyType = typeof(WorkflowContextArgumentsResolutionPolicy))]
     public string? WorkflowContextArguments { get; set; }
 
     /// <summary>
