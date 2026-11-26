@@ -1,4 +1,4 @@
-﻿// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
 using Microsoft.Azure.Functions.Worker.Extensions.Abstractions;
@@ -65,6 +65,19 @@ public sealed class AssistantPostInputAttribute : InputBindingAttribute
     /// Table collection name for chat storage.
     /// </summary>
     public string CollectionName { get; set; } = "ChatState";
+
+    /// <summary>
+    /// Optional registered read operation that authenticates the opaque request context
+    /// and returns version-1 ephemeral instructions, allowed tools and trusted identity overrides.
+    /// Null preserves existing behavior. Invalid or unavailable context fails closed.
+    /// </summary>
+    public string? WorkflowContextOperation { get; set; }
+
+    /// <summary>
+    /// Opaque server-bound request context for the internal context operation. Never
+    /// populated from model arguments, exposed to the model or stored in chat history.
+    /// </summary>
+    public string? WorkflowContextArguments { get; set; }
 
     /// <summary>
     /// Gets or sets declared tool dependencies as a semicolon-separated list of

@@ -55,7 +55,7 @@ internal sealed class AssistantToolWorkflow
 
     internal async Task<IReadOnlyList<ToolExecution>> ExecuteSequentialAsync(
         IReadOnlyList<ChatToolCall> calls,
-        Func<ChatToolCall, Task<string?>> invokeAsync)
+        Func<ChatToolCall, Task<string?>> invokeAsync, Func<ChatToolCall, bool>? isAllowed = null)
     {
         var executions = new List<ToolExecution>(calls.Count);
         bool failedMutationInBatch = false;
@@ -63,8 +63,15 @@ internal sealed class AssistantToolWorkflow
         {
             string? result;
             ToolExecutionDisposition disposition;
-            bool? recoveryRead = this.recovery.Authorize(call);
-            if (recoveryRead == false)
+            bool allowed = isAllowed?.Invoke(call) ?? true;
+            bool? recoveryRead = allowed ? this.recovery.Authorize(call) : null;
+            if (!allowed)
+            {
+                result = Newtonsoft.Json.JsonConvert.SerializeObject(new { success = false, operation = call.FunctionName,
+                    outcome = "not_attempted", errorCode = "workflow_context_tool_not_allowed", retryable = false });
+                disposition = ToolExecutionDisposition.ContextBlocked;
+            }
+            else if (recoveryRead == false)
             {
                 result = RecoveryBlockedResult(call.FunctionName);
                 disposition = ToolExecutionDisposition.DependencyBlocked;
@@ -363,6 +370,7 @@ internal sealed class AssistantToolWorkflow
     {
         Invoked,
         DuplicateBlocked,
-        DependencyBlocked
+        DependencyBlocked,
+        ContextBlocked
     }
 }

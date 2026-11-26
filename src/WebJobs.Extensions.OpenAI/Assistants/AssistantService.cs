@@ -147,6 +147,14 @@ class DefaultAssistantService : IAssistantService
         DateTime timeFilter = DateTime.UtcNow;
         this.ValidateAttributes(attribute);
 
+        AssistantWorkflowContext? initialContext = null;
+        if (!string.IsNullOrWhiteSpace(attribute.WorkflowContextOperation))
+        {
+            initialContext = await this.LoadWorkflowContextAsync(attribute, this.skillInvoker.GetFunctionsDefinitions(), cancellationToken);
+            if (initialContext is null)
+                return new AssistantState(attribute.Id, false, default, default, 0, 0,
+                    new[] { new AssistantMessage(AssistantWorkflowContext.UnavailableResponse, "Assistant", "") });
+        }
         this.logger.LogInformation("Posting message to assistant entity '{Id}'", attribute.Id);
         TableClient tableClient = this.GetOrCreateTableClient(attribute.ChatStorageConnectionSetting, attribute.CollectionName);
 
@@ -163,7 +171,7 @@ class DefaultAssistantService : IAssistantService
         List<TableTransactionAction> batch = new();
         this.AddUserMessageToChat(attribute, chatState, batch);
 
-        await this.ProcessConversationWithLLM(attribute, chatState, batch, cancellationToken);
+        await this.ProcessConversationWithLLM(attribute, chatState, batch, cancellationToken, initialContext);
 
         // Update state and persist changes
         this.UpdateAssistantState(chatState, batch);
@@ -321,7 +329,8 @@ class DefaultAssistantService : IAssistantService
         AssistantPostAttribute attribute,
         InternalChatState chatState,
         List<TableTransactionAction> batch,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        AssistantWorkflowContext? initialContext = null)
     {
         IList<ChatTool>? functions = this.skillInvoker.GetFunctionsDefinitions();
         AssistantToolWorkflow workflow = new(AssistantToolWorkflow.ParseDependencyRules(attribute.ToolWorkflowDependencies),
@@ -340,10 +349,30 @@ class DefaultAssistantService : IAssistantService
         // We loop if the model returns function calls. Otherwise, we break after receiving a response.
         while (true)
         {
-            // Get the LLM response
-            ClientResult<ChatCompletion> response = await this.GetLLMResponse(attribute, chatState, functions, cancellationToken);
+            AssistantWorkflowContext? context = initialContext;
+            initialContext = null;
+            if (!string.IsNullOrWhiteSpace(attribute.WorkflowContextOperation) && context is null)
+            {
+                context = await this.LoadWorkflowContextAsync(attribute, functions, cancellationToken);
+                if (context is null)
+                {
+                    ClearTurnModelProse();
+                    this.AddFiniteAssistantReply(attribute.Id, AssistantWorkflowContext.UnavailableResponse, chatState, batch);
+                    break;
+                }
+            }
+            if (context is not null && (context.Instructions.Length + ApproximateCharsPerToken - 1) / ApproximateCharsPerToken + MessageTokenOverhead
+                >= this.GetMaxContextTokens() - ReservedForResponseTokens - ReservedForFunctionTokens)
+            {
+                ClearTurnModelProse();
+                this.logger.LogWarning("Workflow context policyVersion={PolicyVersion} fallback={Fallback}", "workflow-context-v1", "instruction_budget_unavailable");
+                this.AddFiniteAssistantReply(attribute.Id, AssistantWorkflowContext.UnavailableResponse, chatState, batch);
+                break;
+            }
+            ClientResult<ChatCompletion> response = await this.GetLLMResponse(attribute, chatState,
+                context?.AllowedTools ?? functions, cancellationToken, context?.Instructions);
 
-            List<ChatToolCall> functionCalls = response.Value.ToolCalls.ToList();
+            List<ChatToolCall> functionCalls = response.Value.ToolCalls.Select(call => context?.Canonicalize(call) ?? call).ToList();
             responsePolicy.ObserveCalls(functionCalls);
             if (responsePolicy.IsActive)
                 ClearTurnModelProse();
@@ -354,7 +383,7 @@ class DefaultAssistantService : IAssistantService
             if (functionCalls.Count > 0 && batch.Count + functionCalls.Count + 3 > FunctionCallBatchLimit)
             {
                 responsePolicy.ObserveUnexecutedCalls(functionCalls);
-                if (responsePolicy.IsActive)
+                if (responsePolicy.IsActive || context is not null)
                     ClearTurnModelProse();
                 this.LogBatchLimitExceeded(attribute.Id, functionCalls.Count);
                 this.LogAndAddAssistantReply(attribute.Id,
@@ -367,7 +396,7 @@ class DefaultAssistantService : IAssistantService
                 : this.FormatReplyMessage(response);
             if (!string.IsNullOrWhiteSpace(replyMessage) || functionCalls.Count > 0)
             {
-                this.LogAndAddAssistantReply(attribute.Id, replyMessage, response, chatState, batch);
+                this.LogAndAddAssistantReply(attribute.Id, replyMessage, response, chatState, batch, toolCallsOverride: functionCalls);
             }
             if (functionCalls.Count == 0)
             {
@@ -375,18 +404,40 @@ class DefaultAssistantService : IAssistantService
             }
 
             IReadOnlyList<AssistantToolWorkflow.ToolExecution> executions = await this.ProcessFunctionCalls(
-                attribute.Id, functionCalls, chatState, batch, workflow, cancellationToken);
+                attribute.Id, functionCalls, chatState, batch, workflow, cancellationToken, context);
             responsePolicy.ObserveResults(executions);
+            if (executions.Any(e => e.Disposition == AssistantToolWorkflow.ToolExecutionDisposition.ContextBlocked))
+            {
+                ClearTurnModelProse();
+                this.logger.LogWarning("Workflow context policyVersion={PolicyVersion} fallback={Fallback} blockedToolCount={BlockedToolCount}",
+                    "workflow-context-v1", "tool_not_allowed", executions.Count(e => e.Disposition == AssistantToolWorkflow.ToolExecutionDisposition.ContextBlocked));
+                this.AddFiniteAssistantReply(attribute.Id, AssistantWorkflowContext.BlockedResponse, chatState, batch);
+                break;
+            }
             if (responsePolicy.IsActive)
                 ClearTurnModelProse();
         }
+    }
+
+    async Task<AssistantWorkflowContext?> LoadWorkflowContextAsync(AssistantPostAttribute attribute,
+        IList<ChatTool>? functions, CancellationToken cancellationToken)
+    {
+        var started = System.Diagnostics.Stopwatch.StartNew();
+        AssistantWorkflowContext? context = await AssistantWorkflowContext.LoadAsync(this.skillInvoker, attribute.WorkflowContextOperation,
+            attribute.WorkflowContextArguments, attribute.Id, functions, cancellationToken, attribute.UserMessage);
+        this.logger.LogInformation("Workflow context policyVersion={PolicyVersion} available={Available} selectedToolCount={SelectedToolCount} instructionChars={InstructionChars} estimatedInstructionTokens={EstimatedInstructionTokens} latencyMs={LatencyMs}",
+            "workflow-context-v1", context is not null, context?.AllowedTools.Count ?? 0, context?.Instructions.Length ?? 0,
+            context is null ? 0 : (context.Instructions.Length + ApproximateCharsPerToken - 1) / ApproximateCharsPerToken, started.Elapsed.TotalMilliseconds);
+        if (context is null)
+            this.logger.LogWarning("Workflow context policyVersion={PolicyVersion} fallback={Fallback}", "workflow-context-v1", "context_unavailable");
+        return context;
     }
 
     async Task<ClientResult<ChatCompletion>> GetLLMResponse(
         AssistantPostAttribute attribute,
         InternalChatState chatState,
         IList<ChatTool>? functions,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, string? ephemeralInstructions = null)
     {
         ChatCompletionOptions chatRequest = attribute.BuildRequest();
         if (functions is not null)
@@ -397,8 +448,13 @@ class DefaultAssistantService : IAssistantService
             }
         }
 
-        IReadOnlyList<ChatMessageTableEntity> trimmedMessages = this.TrimMessagesForContextBudget(attribute.Id, chatState.Messages);
+        int extraContextTokens = ephemeralInstructions is null ? 0 : (ephemeralInstructions.Length + ApproximateCharsPerToken - 1) / ApproximateCharsPerToken + MessageTokenOverhead;
+        IReadOnlyList<ChatMessageTableEntity> trimmedMessages = ephemeralInstructions is null
+            ? this.TrimMessagesForContextBudget(attribute.Id, chatState.Messages)
+            : this.TrimMessagesWithContextReservation(attribute.Id, chatState.Messages, extraContextTokens);
         IEnumerable<ChatMessage> chatMessages = ToOpenAIChatRequestMessages(trimmedMessages);
+        if (ephemeralInstructions is not null)
+            chatMessages = chatMessages.Append(new SystemChatMessage(ephemeralInstructions));
 
         return await this.openAIClientFactory.GetChatClient(
             attribute.AIConnectionName,
@@ -407,9 +463,12 @@ class DefaultAssistantService : IAssistantService
 
     List<ChatMessageTableEntity> TrimMessagesForContextBudget(
         string assistantId,
-        IReadOnlyList<ChatMessageTableEntity> sourceMessages)
+        IReadOnlyList<ChatMessageTableEntity> sourceMessages) => this.TrimMessagesWithContextReservation(assistantId, sourceMessages, 0);
+
+    List<ChatMessageTableEntity> TrimMessagesWithContextReservation(string assistantId,
+        IReadOnlyList<ChatMessageTableEntity> sourceMessages, int extraContextTokens)
     {
-        int effectiveContextBudget = this.GetMaxContextTokens() - ReservedForResponseTokens - ReservedForFunctionTokens;
+        int effectiveContextBudget = this.GetMaxContextTokens() - ReservedForResponseTokens - ReservedForFunctionTokens - extraContextTokens;
         List<ChatMessageTableEntity> requestMessages = sourceMessages.Select(CloneChatMessageForRequest).ToList();
 
         int beforeEstimate = EstimateRequestTokens(requestMessages);
@@ -723,7 +782,7 @@ class DefaultAssistantService : IAssistantService
         ClientResult<ChatCompletion> response,
         InternalChatState chatState,
         List<TableTransactionAction> batch,
-        bool includeToolCalls = true)
+        bool includeToolCalls = true, IReadOnlyList<ChatToolCall>? toolCallsOverride = null)
     {
         this.logger.LogInformation(
             "[{Id}] Got LLM response consisting of {Count} tokens: [{Text}] && {Count} ToolCalls",
@@ -737,7 +796,7 @@ class DefaultAssistantService : IAssistantService
             messageIndex: ++chatState.Metadata.TotalMessages,
             content: EncodeContentForTableStorage(replyMessage),
             role: ChatMessageRole.Assistant,
-            toolCalls: includeToolCalls ? response.Value.ToolCalls : null);
+            toolCalls: includeToolCalls ? toolCallsOverride ?? response.Value.ToolCalls : null);
 
         chatState.Messages.Add(replyFromAssistantEntity);
         batch.Add(new TableTransactionAction(TableTransactionActionType.Add, replyFromAssistantEntity));
@@ -746,6 +805,14 @@ class DefaultAssistantService : IAssistantService
             "[{Id}] Chat length is now {Count} messages",
             assistantId,
             chatState.Metadata.TotalMessages);
+    }
+
+    void AddFiniteAssistantReply(string assistantId, string text, InternalChatState chatState, List<TableTransactionAction> batch)
+    {
+        var reply = new ChatMessageTableEntity(assistantId, ++chatState.Metadata.TotalMessages,
+            EncodeContentForTableStorage(text), ChatMessageRole.Assistant);
+        chatState.Messages.Add(reply);
+        batch.Add(new TableTransactionAction(TableTransactionActionType.Add, reply));
     }
 
     void LogBatchLimitExceeded(string assistantId, int functionCallCount)
@@ -763,7 +830,7 @@ class DefaultAssistantService : IAssistantService
         InternalChatState chatState,
         List<TableTransactionAction> batch,
         AssistantToolWorkflow workflow,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, AssistantWorkflowContext? context = null)
     {
         this.logger.LogInformation(
             "[{Id}] Found {Count} function call(s) in response",
@@ -777,7 +844,7 @@ class DefaultAssistantService : IAssistantService
                     assistantId,
                     call,
                     workflow,
-                    cancellationToken));
+                    cancellationToken, context), context is null ? null : context.Allows);
 
         foreach (AssistantToolWorkflow.ToolExecution execution in executions)
         {
@@ -811,7 +878,7 @@ class DefaultAssistantService : IAssistantService
         string assistantId,
         ChatToolCall call,
         AssistantToolWorkflow workflow,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, AssistantWorkflowContext? context = null)
     {
         this.logger.LogInformation(
             "[{Id}] Calling function={Name} fingerprint={Fingerprint}",
@@ -830,7 +897,9 @@ class DefaultAssistantService : IAssistantService
                 call.FunctionName,
                 AssistantToolWorkflow.Fingerprint(call),
                 AssistantToolWorkflow.Fingerprint(correctedCall!));
-            functionResult = await this.InvokeFunctionWithErrorHandling(assistantId, correctedCall!, cancellationToken);
+            correctedCall = context?.Canonicalize(correctedCall!) ?? (context is null ? correctedCall : null);
+            if (correctedCall is null || context is not null && !context.Allows(correctedCall)) return functionResult;
+            functionResult = await this.InvokeFunctionWithErrorHandling(assistantId, correctedCall, cancellationToken);
             workflow.Record(correctedCall!, functionResult);
         }
 
