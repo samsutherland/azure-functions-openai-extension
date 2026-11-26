@@ -925,6 +925,23 @@ public partial class DefaultAssistantServiceTests
             expectedReply: expected, planResult: Newtonsoft.Json.JsonConvert.SerializeObject(planResult), planCount: planCount);
     }
 
+    [Fact]
+    public async Task PostMessageAsync_DeliveryReceiptsSuppressProseInReturnedAndStoredMessages()
+    {
+        var result = AssistantScopedDeliveryResponseTests.Result();
+        var first = AssistantScopedDeliveryResponseTests.Receipt("2026-11-26", "garmin", "schedule_created_watch_sync_required", true);
+        var second = AssistantScopedDeliveryResponseTests.Receipt("2026-11-27", "garmin", "unknown");
+        second["verified"] = false; result["providerEvidenceVerified"] = false;
+        result["success"] = false; result["outcome"] = "unknown";
+        result["deliveryOutcomes"] = new Newtonsoft.Json.Linq.JArray(first, second);
+        const string setup = "{\"schemaVersion\":1,\"operation\":\"GetTrainingSetupStatusSkill\",\"success\":true,\"verified\":true,\"outcome\":\"ready\",\"ready\":true}";
+        string expected = "Saved plan state was verified in the app. Saved dates: 2026-11-26, 2026-11-27.\n"
+            + "2026-11-26: Garmin accepted the workout schedule. Watch visibility is not confirmed; Garmin Connect/watch sync may still be required.\n"
+            + "2026-11-27: I couldn't verify Garmin delivery. Provider delivery and watch visibility are not confirmed.";
+        await PostMessageAsync_EvidencePolicySuppressesFalseClaimsInStoredAndReturnedMessages(setup, 1,
+            expectedReply: expected, planResult: Newtonsoft.Json.JsonConvert.SerializeObject(result.ToString()), deliveryOperation: "FinalizeWeeklyPlanSkill");
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -950,10 +967,10 @@ public partial class DefaultAssistantServiceTests
     [InlineData("{\"schemaVersion\":1,\"operation\":\"GetTrainingSetupStatusSkill\",\"success\":false,\"verified\":true,\"outcome\":\"needs_user_input\",\"promptContext\":\"Goal: climb confidently. Monday: 0 hours.\",\"nextQuestion\":\"Does that feel right?\"}", 1, true, true, "Goal: climb confidently. Monday: 0 hours.\n\nDoes that feel right?")]
     [InlineData("{\"schemaVersion\":1,\"operation\":\"GetTrainingSetupStatusSkill\",\"success\":true,\"verified\":true,\"outcome\":\"ready\",\"ready\":true}", 1, true, true, "Here is your saved-week summary.")]
     public async Task PostMessageAsync_EvidencePolicySuppressesFalseClaimsInStoredAndReturnedMessages(
-        string setupResult, int toolCount, bool enabled = true, bool prerequisiteOnly = false, string? expectedReply = null, string? planResult = null, int planCount = 1, bool replacement = false, string? secondReplacementResult = null)
+        string setupResult, int toolCount, bool enabled = true, bool prerequisiteOnly = false, string? expectedReply = null, string? planResult = null, int planCount = 1, bool replacement = false, string? secondReplacementResult = null, string? deliveryOperation = null)
     {
         const string assistantId = "evidence-test";
-        string operation = replacement ? "ReplaceWeeklyWorkoutSkill" : "GenerateWeeklyPlanSkill";
+        string operation = deliveryOperation ?? (replacement ? "ReplaceWeeklyWorkoutSkill" : "GenerateWeeklyPlanSkill");
         var attribute = new AssistantPostAttribute(assistantId, "Build my plan")
         {
             ToolWorkflowDependencies = "GetTrainingSetupStatusSkill>GenerateWeeklyPlanSkill"
@@ -970,7 +987,8 @@ public partial class DefaultAssistantServiceTests
             attribute.ToolResponsePrerequisites = "GetTrainingSetupStatusSkill";
         }
         var setup = ChatToolCall.CreateFunctionToolCall("setup", "GetTrainingSetupStatusSkill", BinaryData.FromString("{}"));
-        var plan = replacement ? AssistantScopedReplacementResponseTests.Call()
+        var plan = deliveryOperation is not null ? AssistantScopedDeliveryResponseTests.Call()
+            : replacement ? AssistantScopedReplacementResponseTests.Call()
             : ChatToolCall.CreateFunctionToolCall("plan", operation, BinaryData.FromString(planResult is null ? "{}" : "{\"userId\":1,\"weekStart\":\"2026-11-26\"}"));
         var chatClient = new Mock<ChatClient>();
         var completions = new Queue<ChatCompletion>(new[]

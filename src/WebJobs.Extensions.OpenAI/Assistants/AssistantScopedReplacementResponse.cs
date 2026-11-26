@@ -34,7 +34,12 @@ internal static class AssistantScopedReplacementResponse
             && Regex.IsMatch(Text(result["revision"]) ?? "", @"\Asha256:[a-f0-9]{64}\z")
             && (result["updatedUtc"]?.Type == JTokenType.Date || (Regex.IsMatch(Text(result["updatedUtc"]) ?? "", @"\A\d{4}-\d{2}-\d{2}T") && DateTimeOffset.TryParse(Text(result["updatedUtc"]), CultureInfo.InvariantCulture, DateTimeStyles.None, out _)))
             && (result["error"] is null || result["error"]!.Type == JTokenType.Null || Text(result["error"]) == ""))
-            return prefix + "Your replacement workout was saved and verified in the app. Provider delivery is not confirmed.";
+        {
+            string saved = prefix + "Your replacement workout was saved and verified in the app.";
+            return result["deliveryOutcomes"] is JArray { Count: > 0 }
+                ? saved + Environment.NewLine + AssistantScopedDeliveryResponse.RenderReplacementReceipts(result, args)
+                : saved + " Provider delivery is not confirmed.";
+        }
         if (bound && result!["success"]?.Type == JTokenType.Boolean && !True(result["success"])
             && (Text(result["outcome"]) is "failed" or "constraint_violation")
             && !True(result["canTellAthleteSaved"]) && !True(result["persisted"]))

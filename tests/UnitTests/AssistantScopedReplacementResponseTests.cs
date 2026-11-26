@@ -112,6 +112,21 @@ public class AssistantScopedReplacementResponseTests
         Assert.Contains("2026-11-27: Your replacement workout was saved", policy.Render());
     }
 
+    [Fact]
+    public void ImmediateReplacementUsesOnlySameRevisionProviderReceipts()
+    {
+        var result = Saved();
+        result["deliveryOutcomes"] = new JArray(AssistantScopedDeliveryResponseTests.Receipt("2026-11-26", "garmin", "schedule_created_watch_sync_required", true));
+        result["providerEvidenceVerified"] = true;
+        var policy = Policy(); Add(policy, result);
+        Assert.Contains("Garmin accepted the workout schedule.", policy.Render());
+        Assert.Contains("Watch visibility is not confirmed", policy.Render());
+        result["revision"] = "sha256:" + new string('d', 64);
+        policy = Policy(); Add(policy, result);
+        Assert.DoesNotContain("accepted", policy.Render());
+        Assert.Contains("could not be verified", policy.Render());
+    }
+
     internal static JObject Saved(string date = "2026-11-26") => JObject.FromObject(new
     {
         schemaVersion = 1, operation = "ReplaceWeeklyWorkoutSkill", actorId = 1, weeklyPlanId = 15, date,

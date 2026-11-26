@@ -15,7 +15,7 @@ internal sealed class AssistantToolResponsePolicy
     readonly HashSet<string> operations;
     readonly HashSet<string> prerequisites;
     readonly List<AssistantToolWorkflow.ToolExecution> results = new();
-    readonly List<ChatToolCall> unexecutedReplacementCalls = new();
+    readonly List<ChatToolCall> unexecutedScopedCalls = new();
 
     internal AssistantToolResponsePolicy(string? operationNames, string? prerequisiteNames = null)
     {
@@ -38,8 +38,8 @@ internal sealed class AssistantToolResponsePolicy
         {
             if (!this.operations.Contains(call.FunctionName) && !this.prerequisites.Contains(call.FunctionName)) continue;
             this.IsActive = true;
-            if (this.operations.Contains(call.FunctionName) && AssistantScopedReplacementResponse.IsReplacement(call))
-                this.unexecutedReplacementCalls.Add(call);
+            if (this.operations.Contains(call.FunctionName) && (AssistantScopedReplacementResponse.IsReplacement(call) || AssistantScopedDeliveryResponse.IsDelivery(call)))
+                this.unexecutedScopedCalls.Add(call);
             else
                 this.hasUnexecutedSensitiveCalls = true;
         }
@@ -71,7 +71,7 @@ internal sealed class AssistantToolResponsePolicy
 
     internal string Render()
     {
-        if ((this.results.Count == 0 && this.unexecutedReplacementCalls.Count == 0) || this.hasUnexecutedSensitiveCalls)
+        if ((this.results.Count == 0 && this.unexecutedScopedCalls.Count == 0) || this.hasUnexecutedSensitiveCalls)
         {
             return UnverifiedResponse;
         }
@@ -79,7 +79,7 @@ internal sealed class AssistantToolResponsePolicy
         var messages = new List<string>();
         var planRevisions = new Dictionary<string, string>();
         var current = new List<AssistantToolWorkflow.ToolExecution>();
-        foreach (AssistantToolWorkflow.ToolExecution execution in this.results.Concat(this.unexecutedReplacementCalls.Select(call =>
+        foreach (AssistantToolWorkflow.ToolExecution execution in this.results.Concat(this.unexecutedScopedCalls.Select(call =>
             new AssistantToolWorkflow.ToolExecution(call, "", AssistantToolWorkflow.ToolExecutionDisposition.DependencyBlocked))))
         {
             JObject? args = AssistantScopedReplacementResponse.Arguments(execution.Call);
@@ -94,23 +94,40 @@ internal sealed class AssistantToolResponsePolicy
                     JObject? priorArgs = AssistantScopedReplacementResponse.Arguments(prior.Call);
                     return priorResult?["weeklyPlanId"] is not null
                         && JToken.DeepEquals(priorResult["weeklyPlanId"], args["weeklyPlanId"])
-                        && priorResult["savedDates"] is not null
+                        && (priorResult["savedDates"] is not null || AssistantScopedDeliveryResponse.IsDelivery(prior.Call))
+                        || AssistantScopedDeliveryResponse.IsDelivery(prior.Call)
+                        && JToken.DeepEquals(AssistantScopedDeliveryResponse.Arguments(prior.Call)?["weeklyPlanId"], args["weeklyPlanId"])
                         || AssistantScopedReplacementResponse.IsReplacement(prior.Call)
                         && JToken.DeepEquals(priorArgs?["weeklyPlanId"], args["weeklyPlanId"])
                         && JToken.DeepEquals(priorArgs?["date"], args["date"]);
                 });
             }
+            else if (AssistantScopedDeliveryResponse.IsDelivery(execution.Call))
+            {
+                JObject? deliveryArgs = AssistantScopedDeliveryResponse.Arguments(execution.Call);
+                current.RemoveAll(prior =>
+                {
+                    JObject? priorArgs = AssistantScopedDeliveryResponse.Arguments(prior.Call);
+                    JObject? priorResult = ParseVerifiedResult(prior);
+                    return deliveryArgs?["weeklyPlanId"] is not null
+                        && (JToken.DeepEquals(priorArgs?["weeklyPlanId"], deliveryArgs["weeklyPlanId"])
+                            || JToken.DeepEquals(priorResult?["weeklyPlanId"], deliveryArgs["weeklyPlanId"]))
+                        && (execution.Call.FunctionName == "FinalizeWeeklyPlanSkill"
+                            || priorResult?["savedDates"] is not null && !AssistantScopedDeliveryResponse.IsDelivery(prior.Call)
+                            || JToken.DeepEquals(priorArgs?["date"], deliveryArgs["date"]));
+                });
+            }
             else if (evidence?["savedDates"] is not null)
             {
-                current.RemoveAll(prior => AssistantScopedReplacementResponse.IsReplacement(prior.Call)
-                    && JToken.DeepEquals(AssistantScopedReplacementResponse.Arguments(prior.Call)?["weeklyPlanId"], evidence["weeklyPlanId"]));
+                current.RemoveAll(prior => (AssistantScopedReplacementResponse.IsReplacement(prior.Call) || AssistantScopedDeliveryResponse.IsDelivery(prior.Call))
+                    && JToken.DeepEquals(AssistantScopedDeliveryResponse.Arguments(prior.Call)?["weeklyPlanId"], evidence["weeklyPlanId"]));
             }
             current.Add(execution);
         }
         foreach (AssistantToolWorkflow.ToolExecution execution in current)
         {
             JObject? evidence = ParseVerifiedResult(execution);
-            if (evidence?["savedDates"] is not null && evidence["weeklyPlanId"] is not null)
+            if (evidence?["savedDates"] is not null && evidence["weeklyPlanId"] is not null && !AssistantScopedDeliveryResponse.IsDelivery(execution.Call))
             {
                 string scope = evidence["actorId"] + ":" + evidence["weeklyPlanId"];
                 string revision = evidence["revision"]?.ToString() ?? "";
@@ -134,6 +151,8 @@ internal sealed class AssistantToolResponsePolicy
     {
         if (AssistantScopedReplacementResponse.IsReplacement(execution.Call))
             return AssistantScopedReplacementResponse.Render(execution);
+        if (AssistantScopedDeliveryResponse.IsDelivery(execution.Call))
+            return AssistantScopedDeliveryResponse.Render(execution);
         // Runtime disposition proves this attempt had no side effects. Preserve a
         // verified prerequisite question alongside it; invoked/unknown results still fail closed.
         if (execution.Disposition == AssistantToolWorkflow.ToolExecutionDisposition.DependencyBlocked)
