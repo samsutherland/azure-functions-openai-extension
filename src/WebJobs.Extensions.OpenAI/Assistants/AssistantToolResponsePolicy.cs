@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+using System.Globalization;
 using Newtonsoft.Json.Linq;
 using OpenAI.Chat;
 
@@ -169,7 +170,8 @@ internal sealed class AssistantToolResponsePolicy
             return "Your saved setup is ready.";
         }
         if (success && outcome == "saved"
-            && IsTrue(result["persisted"]) && IsTrue(result["canTellAthleteSaved"]))
+            && IsTrue(result["persisted"]) && IsTrue(result["canTellAthleteSaved"])
+            && (execution.Call.FunctionName != "SetPowerZonesSkill" || IsBoundPowerZonesSave(result, execution.Call)))
         {
             return "Your change was saved and verified in the app. Device delivery is not confirmed.";
         }
@@ -189,6 +191,22 @@ internal sealed class AssistantToolResponsePolicy
                 : savedContext + Environment.NewLine + Environment.NewLine + question;
         }
         return null;
+    }
+
+    static bool IsBoundPowerZonesSave(JObject result, ChatToolCall call)
+    {
+        JObject? args = AssistantScopedDeliveryResponse.Arguments(call);
+        if (args is null || result["actorId"]?.Type != JTokenType.Integer
+            || !int.TryParse(result["actorId"]!.ToString(), out int actor) || actor <= 0
+            || !JToken.DeepEquals(result["actorId"], result["userId"])
+            || args["userId"] is JToken requestedActor && requestedActor.Type != JTokenType.Null
+                && !JToken.DeepEquals(requestedActor, result["actorId"])
+            || !args.TryGetValue("ftpOverrideWatts", out JToken? requested)
+            || !result.TryGetValue("ftpOverrideWatts", out JToken? stored)) return false;
+        if (requested.Type == JTokenType.Null) return stored.Type == JTokenType.Null;
+        return requested.Type is JTokenType.Integer or JTokenType.String
+            && int.TryParse(requested.ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out int watts)
+            && watts is >= 50 and <= 500 && stored.Type == JTokenType.Integer && stored.ToString() == watts.ToString(CultureInfo.InvariantCulture);
     }
 
     static JObject? ParseVerifiedResult(AssistantToolWorkflow.ToolExecution execution) =>
