@@ -21,6 +21,8 @@ internal sealed class AssistantToolResponsePolicy
     AssistantToolWorkflow.ToolExecution? contextConflict;
     JObject? contextDetails;
     bool requiresDetailsEvidence;
+    bool requiresObservationEvidence;
+    JObject? contextObservation;
     bool requiresOperationEvidence;
 
     internal AssistantToolResponsePolicy(string? operationNames, string? prerequisiteNames = null)
@@ -43,6 +45,12 @@ internal sealed class AssistantToolResponsePolicy
         this.requiresDetailsEvidence |= required;
         this.IsActive |= required;
         this.contextDetails = details;
+    }
+    internal void ObserveContextObservation(bool required, JObject? observation)
+    {
+        this.requiresObservationEvidence |= required;
+        this.IsActive |= required;
+        this.contextObservation = observation;
     }
     bool hasUnexecutedSensitiveCalls;
 
@@ -92,7 +100,11 @@ internal sealed class AssistantToolResponsePolicy
                     prior.Call, prior.Result, execution.Call, execution.Result));
             bool blockedPrerequisite = this.prerequisites.Contains(execution.Call.FunctionName)
                 && !IsVerifiedReady(execution);
-            this.IsActive |= blockedPrerequisite;
+            // Incidental setup reads must not hijack unrelated activity/advice replies.
+            // The failed read is retained for a subsequent configured operation.
+            // A legacy prerequisite-only configuration remains an explicit opt-in.
+            this.IsActive |= this.operations.Contains(execution.Call.FunctionName)
+                || this.operations.Count == 0 && blockedPrerequisite;
             if (blockedPrerequisite || replacesPriorRead || this.operations.Contains(execution.Call.FunctionName))
                 this.results.Add(execution);
         }
@@ -114,6 +126,9 @@ internal sealed class AssistantToolResponsePolicy
         if (this.requiresDetailsEvidence && !this.requiresOperationEvidence
             && !this.results.Any(e => this.operations.Contains(e.Call.FunctionName)) && this.unexecutedScopedCalls.Count == 0)
             return AssistantSavedWorkoutDetailsResponse.Render(this.contextDetails);
+        if (this.requiresObservationEvidence && this.contextConflict is null && this.contextPrerequisite is null
+            && !this.results.Any(e => this.operations.Contains(e.Call.FunctionName)) && this.unexecutedScopedCalls.Count == 0)
+            return AssistantExistingStateResponse.Render(this.contextObservation);
         if (this.results.Count == 0 && this.unexecutedScopedCalls.Count == 0 && this.contextConflict is null)
             return this.contextPrerequisite is null ? UnverifiedResponse : RenderResult(this.contextPrerequisite) ?? UnverifiedResponse;
 

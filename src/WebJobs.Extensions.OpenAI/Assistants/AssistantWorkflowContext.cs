@@ -12,11 +12,15 @@ namespace Microsoft.Azure.WebJobs.Extensions.OpenAI.Assistants;
 // freshness. Its opaque request context is used only for the internal invocation.
 internal sealed record AssistantWorkflowContext(string Instructions, IList<ChatTool> AllowedTools, JObject? ArgumentOverrides, bool RequireOperationEvidence, JObject? ResponsePrerequisite, AssistantToolWorkflow.ToolExecution? ResponseConflict, bool RequireDetailsEvidence, JObject? ResponseDetails)
 {
+    internal JObject? OperationArgumentOverrides { get; init; }
+    internal bool RequireObservationEvidence { get; init; }
+    internal JObject? ResponseObservation { get; init; }
+
     internal const string UnavailableResponse = "I couldn't verify the current workflow context. Please try again; completion and provider delivery are not confirmed.";
     internal const string BlockedResponse = "A requested tool is unavailable for the current workflow. Completion and provider delivery are not confirmed.";
 
     internal static async Task<AssistantWorkflowContext?> LoadAsync(IAssistantSkillInvoker invoker, string? operation,
-        string? requestContext, string assistantId, IList<ChatTool>? registered, CancellationToken cancellationToken, string? userMessage = null)
+        string? requestContext, string assistantId, IList<ChatTool>? registered, CancellationToken cancellationToken, string? userMessage = null, string? internalOperationNames = null)
     {
         if (!Name(operation) || string.IsNullOrWhiteSpace(requestContext) || requestContext.Length > 16384
             || string.IsNullOrWhiteSpace(assistantId) || assistantId.Length > 1024 || userMessage?.Length > 16384
@@ -31,12 +35,13 @@ internal sealed record AssistantWorkflowContext(string Instructions, IList<ChatT
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
         catch { return null; }
-        if (text?.Length > 65536 || AssistantToolWorkflow.ParseResult(text) is not JObject result
+        if (text?.Length > 65536 || ParseContext(text) is not JObject result
             || result["schemaVersion"]?.Type != JTokenType.Integer || result["schemaVersion"]!.ToString() != "1"
             || result["operation"]?.Type != JTokenType.String || result["operation"]!.Value<string>() != operation
             || !True(result["success"]) || !True(result["verified"])
             || result["requireOperationEvidence"] is JToken evidencePolicy && evidencePolicy.Type != JTokenType.Boolean
             || result["requireDetailsEvidence"] is JToken detailsPolicy && detailsPolicy.Type != JTokenType.Boolean
+            || result["requireObservationEvidence"] is JToken observationPolicy && observationPolicy.Type != JTokenType.Boolean
             || result["instructions"]?.Type != JTokenType.String || string.IsNullOrWhiteSpace(result["instructions"]!.Value<string>())
             || result["instructions"]!.Value<string>()!.Length > 16384
             || result["allowedToolNames"] is not JArray names || names.Count > 128
@@ -52,6 +57,21 @@ internal sealed record AssistantWorkflowContext(string Instructions, IList<ChatT
                 || values["externalUserId"] is JToken external && (external.Type != JTokenType.String || string.IsNullOrWhiteSpace(external.Value<string>()) || external.Value<string>()!.Length > 256))
                 return null;
             overrides = (JObject)values.DeepClone();
+        }
+        var internalOperations = new HashSet<string>((internalOperationNames ?? "").Split(';').Select(n => n.Trim()), StringComparer.OrdinalIgnoreCase);
+        JObject? operationOverrides = null;
+        if (result["toolOperationArgumentOverrides"] is JToken bindings && bindings.Type != JTokenType.Null)
+        {
+            if (bindings is not JObject map || map.Count > 32 || map.ToString(Formatting.None).Length > 8192
+                || map.Properties().Select(p => p.Name).Distinct(StringComparer.OrdinalIgnoreCase).Count() != map.Count
+                || map.Properties().Any(p => !names.Any(n => n.Value<string>() == p.Name) || p.Name == operation || internalOperations.Contains(p.Name)
+                    || p.Value is not JObject values || values.Count > 32
+                    || values.Properties().Select(v => v.Name).Distinct(StringComparer.OrdinalIgnoreCase).Count() != values.Count
+                    || values.Properties().Any(v => !Regex.IsMatch(v.Name, @"\A[A-Za-z][A-Za-z0-9_]{0,63}\z")
+                        || Identity(v.Name) || v.Value.Type is not (JTokenType.String or JTokenType.Boolean or JTokenType.Integer or JTokenType.Null)
+                        || v.Value.Type == JTokenType.String && v.Value.Value<string>()!.Length > 1024
+                        || v.Value.Type == JTokenType.Integer && !long.TryParse(v.Value.ToString(), out _)))) return null;
+            operationOverrides = (JObject)map.DeepClone();
         }
         JObject? prerequisite = null;
         if (result["responsePrerequisite"] is JToken prerequisiteToken && prerequisiteToken.Type != JTokenType.Null)
@@ -81,7 +101,12 @@ internal sealed record AssistantWorkflowContext(string Instructions, IList<ChatT
         {
             if (detailsToken is not JObject facts || (details = AssistantSavedWorkoutDetailsResponse.Validate(facts, overrides?["userId"])) is null) return null;
         }
-        return new(result["instructions"]!.Value<string>()!, registered.Where(t => names.Any(n => n.Value<string>() == t.FunctionName)).ToList(), overrides, True(result["requireOperationEvidence"]), prerequisite, conflict, True(result["requireDetailsEvidence"]), details);
+        JObject? observation = null;
+        if (result["responseObservation"] is JToken observationToken && observationToken.Type != JTokenType.Null)
+        {
+            if (observationToken is not JObject facts || (observation = AssistantExistingStateResponse.Validate(facts, overrides?["userId"])) is null) return null;
+        }
+        return new(result["instructions"]!.Value<string>()!, registered.Where(t => names.Any(n => n.Value<string>() == t.FunctionName)).ToList(), overrides, True(result["requireOperationEvidence"]), prerequisite, conflict, True(result["requireDetailsEvidence"]), details) { OperationArgumentOverrides = operationOverrides, RequireObservationEvidence = True(result["requireObservationEvidence"]), ResponseObservation = observation };
     }
 
     internal ChatToolCall? Canonicalize(ChatToolCall call)
@@ -96,6 +121,14 @@ internal sealed record AssistantWorkflowContext(string Instructions, IList<ChatT
             _ => null
         };
         if (payload is null) return null;
+        if (this.OperationArgumentOverrides?[call.FunctionName] is JObject bindings)
+        {
+            foreach (JProperty value in bindings.Properties())
+            {
+                foreach (JProperty competing in payload.Properties().Where(p => p.Name.Equals(value.Name, StringComparison.OrdinalIgnoreCase)).ToList()) competing.Remove();
+                payload[value.Name] = value.Value.DeepClone();
+            }
+        }
         if (this.ArgumentOverrides is { Count: > 0 })
         {
             // Remove both competing selectors: the application resolver may prefer
@@ -109,6 +142,19 @@ internal sealed record AssistantWorkflowContext(string Instructions, IList<ChatT
     }
 
     internal bool Allows(ChatToolCall call) => this.AllowedTools.Any(t => t.FunctionName == call.FunctionName) && this.Canonicalize(call) is not null;
+    static JToken? ParseContext(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return null;
+        try
+        {
+            var settings = new JsonLoadSettings { DuplicatePropertyNameHandling = DuplicatePropertyNameHandling.Error };
+            JToken value = JToken.Parse(text!, settings);
+            for (int i = 0; i < 2 && value.Type == JTokenType.String; i++) value = JToken.Parse(value.Value<string>()!, settings);
+            return value;
+        }
+        catch (JsonReaderException) { return null; }
+    }
+    static bool Identity(string name) => name.Equals("userId", StringComparison.OrdinalIgnoreCase) || name.Equals("externalUserId", StringComparison.OrdinalIgnoreCase);
     static bool ValidOptionalText(JToken? token, int limit) => token is null || token.Type == JTokenType.Null
         || token.Type == JTokenType.String && token.Value<string>()!.Length <= limit;
     static bool Name(string? name) => name is not null && Regex.IsMatch(name, @"\A[A-Za-z0-9_-]{1,64}\z");

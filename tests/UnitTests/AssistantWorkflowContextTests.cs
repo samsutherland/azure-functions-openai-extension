@@ -148,6 +148,80 @@ public class AssistantWorkflowContextTests
         Assert.Null(await AssistantWorkflowContext.LoadAsync(invoker.Object, "Context", "opaque", "assistant", Tools(), CancellationToken.None));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task TrustedOperationBindingsReplaceModelValuesBeforeInvocation(bool wrapped)
+    {
+        var result = JObject.Parse(Result("current", "Write"));
+        result["toolArgumentOverrides"] = new JObject { ["userId"] = 1 };
+        result["toolOperationArgumentOverrides"] = JObject.Parse("{\"Write\":{\"regenerate\":false,\"regenerationReason\":null,\"weekStart\":\"2026-12-02\",\"reuseOnly\":true}}");
+        var invoker = new Mock<IAssistantSkillInvoker>();
+        invoker.Setup(i => i.InvokeAsync(It.IsAny<ChatToolCall>(), It.IsAny<CancellationToken>())).ReturnsAsync(result.ToString());
+        var context = await AssistantWorkflowContext.LoadAsync(invoker.Object, "Context", "opaque", "assistant", Tools(), CancellationToken.None);
+        Assert.NotNull(context);
+        var payload = JObject.Parse("{\"USERID\":99,\"REGENERATE\":true,\"regenerationReason\":\"replace all\",\"weekStart\":\"2027-01-01\"}");
+        var args = wrapped ? new JObject { ["input"] = payload.ToString() } : payload;
+        var call = context.Canonicalize(ChatToolCall.CreateFunctionToolCall("actual-call", "Write", BinaryData.FromString(args.ToString())));
+        Assert.NotNull(call); Assert.Equal("actual-call", call.Id);
+        var actual = JObject.Parse(call.FunctionArguments.ToString());
+        if (wrapped) actual = JObject.Parse(actual["input"]!.Value<string>()!);
+        Assert.Equal(1, actual["userId"]); Assert.Null(actual["USERID"]);
+        Assert.False(actual["regenerate"]!.Value<bool>()); Assert.Null(actual["REGENERATE"]);
+        Assert.Equal(JTokenType.Null, actual["regenerationReason"]!.Type);
+        Assert.Equal("2026-12-02", actual["weekStart"]); Assert.True(actual["reuseOnly"]!.Value<bool>());
+    }
+
+    [Theory]
+    [InlineData("{\"Unknown\":{\"reuseOnly\":true}}")]
+    [InlineData("{\"Context\":{\"reuseOnly\":true}}")]
+    [InlineData("{\"Write\":{\"userId\":1}}")]
+    [InlineData("{\"Write\":{\"EXTERNALUSERID\":\"victim\"}}")]
+    [InlineData("{\"Write\":{\"reuseOnly\":{\"nested\":true}}}")]
+    [InlineData("{\"Write\":{\"reuseOnly\":[true]}}")]
+    [InlineData("{\"Write\":{\"reuseOnly\":true,\"REUSEONLY\":false}}")]
+    [InlineData("{\"Write\":{\"reuseOnly\":true},\"write\":{\"reuseOnly\":false}}")]
+    [InlineData("{\"Write\":{\"bad.key\":true}}")]
+    [InlineData("{\"Write\":{\"fraction\":1.5}}")]
+    public async Task MalformedOperationBindingsFailClosed(string bindings)
+    {
+        var result = JObject.Parse(Result("current", "Write")); result["toolOperationArgumentOverrides"] = JObject.Parse(bindings);
+        var invoker = new Mock<IAssistantSkillInvoker>();
+        invoker.Setup(i => i.InvokeAsync(It.IsAny<ChatToolCall>(), It.IsAny<CancellationToken>())).ReturnsAsync(result.ToString());
+        Assert.Null(await AssistantWorkflowContext.LoadAsync(invoker.Object, "Context", "opaque", "assistant", Tools(), CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task TrustedBindingsCannotOverrideInternalOperationsOrHideDuplicateJsonKeys()
+    {
+        var result = JObject.Parse(Result("current", "Hidden")); result["toolOperationArgumentOverrides"] = JObject.Parse("{\"Hidden\":{\"reuseOnly\":true}}");
+        var invoker = new Mock<IAssistantSkillInvoker>();
+        invoker.Setup(i => i.InvokeAsync(It.IsAny<ChatToolCall>(), It.IsAny<CancellationToken>())).ReturnsAsync(result.ToString());
+        Assert.Null(await AssistantWorkflowContext.LoadAsync(invoker.Object, "Context", "opaque", "assistant", Tools(), CancellationToken.None, internalOperationNames: "Hidden"));
+        var duplicate = Result("current", "Write").TrimEnd().TrimEnd('}') + ",\"toolOperationArgumentOverrides\":{\"Write\":{\"reuseOnly\":true,\"reuseOnly\":false}}}";
+        invoker.Setup(i => i.InvokeAsync(It.IsAny<ChatToolCall>(), It.IsAny<CancellationToken>())).ReturnsAsync(duplicate);
+        Assert.Null(await AssistantWorkflowContext.LoadAsync(invoker.Object, "Context", "opaque", "assistant", Tools(), CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task BindingsAreBoundedAndDoNotSurviveTheNextSnapshot()
+    {
+        var result = JObject.Parse(Result("current", "Write"));
+        result["toolOperationArgumentOverrides"] = new JObject { ["Write"] = new JObject { ["reason"] = new string('x',1025) } };
+        var invoker = new Mock<IAssistantSkillInvoker>();
+        invoker.Setup(i => i.InvokeAsync(It.IsAny<ChatToolCall>(), It.IsAny<CancellationToken>())).ReturnsAsync(result.ToString());
+        Assert.Null(await AssistantWorkflowContext.LoadAsync(invoker.Object,"Context","opaque","assistant",Tools(),CancellationToken.None));
+        result["toolOperationArgumentOverrides"] = JObject.Parse("{\"Write\":{\"regenerate\":false}}");
+        invoker.Setup(i => i.InvokeAsync(It.IsAny<ChatToolCall>(), It.IsAny<CancellationToken>())).ReturnsAsync(result.ToString());
+        var first = await AssistantWorkflowContext.LoadAsync(invoker.Object,"Context","opaque","assistant",Tools(),CancellationToken.None);
+        result.Remove("toolOperationArgumentOverrides");
+        invoker.Setup(i => i.InvokeAsync(It.IsAny<ChatToolCall>(), It.IsAny<CancellationToken>())).ReturnsAsync(result.ToString());
+        var next = await AssistantWorkflowContext.LoadAsync(invoker.Object,"Context","opaque","assistant",Tools(),CancellationToken.None);
+        var call = ChatToolCall.CreateFunctionToolCall("write","Write", BinaryData.FromString("{\"regenerate\":true}"));
+        Assert.False(JObject.Parse(first!.Canonicalize(call)!.FunctionArguments.ToString())["regenerate"]!.Value<bool>());
+        Assert.True(JObject.Parse(next!.Canonicalize(call)!.FunctionArguments.ToString())["regenerate"]!.Value<bool>());
+    }
+
     internal static JObject Prerequisite(bool ready, string question) => JObject.FromObject(new
     {
         schemaVersion = 1, operation = "GetTrainingSetupStatusSkill", actorId = 1, verified = true,
