@@ -1,4 +1,4 @@
-﻿// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
 using Microsoft.Azure.Functions.Worker.Extensions.Abstractions;
@@ -65,6 +65,56 @@ public sealed class AssistantPostInputAttribute : InputBindingAttribute
     /// Table collection name for chat storage.
     /// </summary>
     public string CollectionName { get; set; } = "ChatState";
+
+    /// <summary>
+    /// Semicolon-separated registered operations reserved for server invocation.
+    /// These operations are never advertised or invoked from model tool calls,
+    /// including when per-turn workflow context is disabled.
+    /// </summary>
+    public string? ToolInternalOperations { get; set; }
+
+    /// <summary>
+    /// Optional registered read operation that authenticates the opaque request context
+    /// and returns version-1 ephemeral instructions, allowed tools and trusted identity overrides.
+    /// Null preserves existing behavior. Invalid or unavailable context fails closed.
+    /// </summary>
+    public string? WorkflowContextOperation { get; set; }
+
+    /// <summary>
+    /// Opaque server-bound request context for the internal context operation. Never
+    /// populated from model arguments, exposed to the model or stored in chat history.
+    /// </summary>
+    public string? WorkflowContextArguments { get; set; }
+
+    /// <summary>
+    /// Gets or sets declared tool dependencies as a semicolon-separated list of
+    /// <c>prerequisite&gt;dependent</c> operation pairs.
+    /// </summary>
+    public string? ToolWorkflowDependencies { get; set; }
+
+    /// <summary>
+    /// Semicolon-separated read&gt;repair pairs. A verified, persisted confirmation
+    /// for the same actor permits one identical read retry per processing invocation.
+    /// Configure only read operations; unknown writes are never retried by this rule.
+    /// </summary>
+    public string? ToolWorkflowRecoveryReads { get; set; }
+
+
+    /// <summary>
+    /// Gets or sets the semicolon-separated tool names whose turns use verified
+    /// result responses instead of model text. Null preserves normal chat rendering.
+    /// Only version 1 operation outcomes can establish completion.
+    /// </summary>
+    public string? ToolResponseOperations { get; set; }
+
+    /// <summary>
+    /// Gets or sets semicolon-separated prerequisite-read names. Incomplete,
+    /// failed or unverified reads use deterministic responses; verified ready
+    /// reads preserve normal coaching and downstream operation rendering.
+    /// </summary>
+    public string? ToolResponsePrerequisites { get; set; }
+
+
 
     /// <summary>
     /// Gets or sets the sampling temperature to use, between 0 and 2. Higher values like 0.8 will make the output

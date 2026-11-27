@@ -19,7 +19,7 @@ using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Extensions.OpenAI.Tests.Assistants;
 
-public class DefaultAssistantServiceTests
+public partial class DefaultAssistantServiceTests
 {
     readonly Mock<OpenAIClientFactory> mockOpenAIClientFactory;
     readonly Mock<AzureComponentFactory> mockAzureComponentFactory;
@@ -890,6 +890,183 @@ public class DefaultAssistantServiceTests
         // Assert
         Assert.Equal(messages.Count, trimmedMessages.Count);
     }
+
+    public static IEnumerable<object[]> WeeklyPlanReplies()
+    {
+        foreach (string outcome in new[] { "generated", "regenerated", "reused_existing", "needs_reconciliation" })
+        {
+            string status = outcome == "reused_existing" ? "Your existing saved weekly plan was reused unchanged."
+                : outcome == "regenerated" ? "Your weekly plan was regenerated and verified in the app."
+                : outcome == "needs_reconciliation" ? "Your weekly plan was saved, but some dates still need adjustment to match your availability."
+                : "Your weekly plan was saved and verified in the app.";
+            yield return new object[] { AssistantScopedPlanResponseTests.Result(outcome).ToString(),
+                status + " Saved dates: 2026-11-26, 2026-11-27."
+                + (outcome == "needs_reconciliation" ? " Dates to review: 2026-11-27." : "")
+                + " Provider delivery is not confirmed.", 1 };
+        }
+        yield return new object[] { "{\"success\":false,\"outcome\":\"unknown\"}", AssistantToolResponsePolicy.UnverifiedResponse, 1 };
+        yield return new object[] { AssistantScopedPlanResponseTests.Result().ToString(), AssistantToolResponsePolicy.UnverifiedResponse, 60 };
+    }
+
+    [Fact]
+    public async Task PostMessageAsync_BlockedPlanningPreservesTheSetupQuestion()
+    {
+        const string setup = "{\"schemaVersion\":1,\"operation\":\"GetTrainingSetupStatusSkill\",\"success\":false,\"verified\":true,\"outcome\":\"needs_user_input\",\"nextQuestion\":\"What is your goal?\"}";
+        await PostMessageAsync_EvidencePolicySuppressesFalseClaimsInStoredAndReturnedMessages(setup, 1,
+            expectedReply: "What is your goal?\n\nThe requested operation was not attempted. Completion and provider delivery are not confirmed.", planResult: "{}");
+    }
+
+    [Theory]
+    [MemberData(nameof(WeeklyPlanReplies))]
+    public async Task PostMessageAsync_WeeklyEvidenceSuppressesContradictoryProseAndPreservesPairs(string planResult, string expected, int planCount)
+    {
+        const string setup = "{\"schemaVersion\":1,\"operation\":\"GetTrainingSetupStatusSkill\",\"success\":true,\"verified\":true,\"outcome\":\"ready\",\"ready\":true}";
+        await PostMessageAsync_EvidencePolicySuppressesFalseClaimsInStoredAndReturnedMessages(setup, 1,
+            expectedReply: expected, planResult: Newtonsoft.Json.JsonConvert.SerializeObject(planResult), planCount: planCount);
+    }
+
+    [Fact]
+    public async Task PostMessageAsync_DeliveryReceiptsSuppressProseInReturnedAndStoredMessages()
+    {
+        var result = AssistantScopedDeliveryResponseTests.Result();
+        var first = AssistantScopedDeliveryResponseTests.Receipt("2026-11-26", "garmin", "schedule_created_watch_sync_required", true);
+        var second = AssistantScopedDeliveryResponseTests.Receipt("2026-11-27", "garmin", "unknown");
+        second["verified"] = false; result["providerEvidenceVerified"] = false;
+        result["success"] = false; result["outcome"] = "unknown";
+        result["deliveryOutcomes"] = new Newtonsoft.Json.Linq.JArray(first, second);
+        const string setup = "{\"schemaVersion\":1,\"operation\":\"GetTrainingSetupStatusSkill\",\"success\":true,\"verified\":true,\"outcome\":\"ready\",\"ready\":true}";
+        string expected = "Saved plan state was verified in the app. Saved dates: 2026-11-26, 2026-11-27.\n"
+            + "2026-11-26: Garmin accepted the workout schedule. Watch visibility is not confirmed; Garmin Connect/watch sync may still be required.\n"
+            + "2026-11-27: I couldn't verify Garmin delivery. Provider delivery and watch visibility are not confirmed.";
+        await PostMessageAsync_EvidencePolicySuppressesFalseClaimsInStoredAndReturnedMessages(setup, 1,
+            expectedReply: expected, planResult: Newtonsoft.Json.JsonConvert.SerializeObject(result.ToString()), deliveryOperation: "FinalizeWeeklyPlanSkill");
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PostMessageAsync_ReplacementEvidencePreservesPartialDatesAndPairs(bool partial)
+    {
+        const string setup = "{\"schemaVersion\":1,\"operation\":\"GetTrainingSetupStatusSkill\",\"success\":true,\"verified\":true,\"outcome\":\"ready\",\"ready\":true}";
+        string expected = "2026-11-26: Your replacement workout was saved and verified in the app. Provider delivery is not confirmed.";
+        if (partial) expected += "\n\n2026-11-27: I couldn't verify the replacement. Check the saved workout before trying again; saved changes and provider delivery are not confirmed.";
+        await PostMessageAsync_EvidencePolicySuppressesFalseClaimsInStoredAndReturnedMessages(setup, 1,
+            expectedReply: expected, planResult: Newtonsoft.Json.JsonConvert.SerializeObject(AssistantScopedReplacementResponseTests.Saved().ToString()),
+            planCount: partial ? 2 : 1, replacement: true, secondReplacementResult: "{}");
+    }
+
+    [Theory]
+    [InlineData("{\"success\":false,\"outcome\":\"failed\"}", 1)]
+    [InlineData("", 1)]
+    [InlineData("not-json", 1)]
+    [InlineData("{\"success\":true,\"outcome\":\"unknown\"}", 1)]
+    [InlineData("", 60)]
+    [InlineData("", 1, false)]
+    [InlineData("", 60, true, true)]
+    [InlineData("{\"success\":false,\"outcome\":\"failed\"}", 1, true, true)]
+    [InlineData("{\"schemaVersion\":1,\"operation\":\"GetTrainingSetupStatusSkill\",\"success\":false,\"verified\":true,\"outcome\":\"needs_user_input\",\"promptContext\":\"Goal: climb confidently. Monday: 0 hours.\",\"nextQuestion\":\"Does that feel right?\"}", 1, true, true, "Goal: climb confidently. Monday: 0 hours.\n\nDoes that feel right?")]
+    [InlineData("{\"schemaVersion\":1,\"operation\":\"GetTrainingSetupStatusSkill\",\"success\":true,\"verified\":true,\"outcome\":\"ready\",\"ready\":true}", 1, true, true, "Here is your saved-week summary.")]
+    public async Task PostMessageAsync_EvidencePolicySuppressesFalseClaimsInStoredAndReturnedMessages(
+        string setupResult, int toolCount, bool enabled = true, bool prerequisiteOnly = false, string? expectedReply = null, string? planResult = null, int planCount = 1, bool replacement = false, string? secondReplacementResult = null, string? deliveryOperation = null)
+    {
+        const string assistantId = "evidence-test";
+        string operation = deliveryOperation ?? (replacement ? "ReplaceWeeklyWorkoutSkill" : "GenerateWeeklyPlanSkill");
+        var attribute = new AssistantPostAttribute(assistantId, "Build my plan")
+        {
+            ToolWorkflowDependencies = "GetTrainingSetupStatusSkill>GenerateWeeklyPlanSkill"
+        };
+        // Reflection keeps this reproduction runnable against the old binding contract.
+        if (enabled)
+        {
+            typeof(AssistantPostAttribute).GetProperty(prerequisiteOnly ? "ToolResponsePrerequisites" : "ToolResponseOperations")?.SetValue(
+                attribute, prerequisiteOnly ? "GetTrainingSetupStatusSkill" : "GetTrainingSetupStatusSkill;GenerateWeeklyPlanSkill");
+        }
+        if (planResult is not null)
+        {
+            attribute.ToolResponseOperations = operation;
+            attribute.ToolResponsePrerequisites = "GetTrainingSetupStatusSkill";
+        }
+        var setup = ChatToolCall.CreateFunctionToolCall("setup", "GetTrainingSetupStatusSkill", BinaryData.FromString("{}"));
+        var plan = deliveryOperation is not null ? AssistantScopedDeliveryResponseTests.Call()
+            : replacement ? AssistantScopedReplacementResponseTests.Call()
+            : ChatToolCall.CreateFunctionToolCall("plan", operation, BinaryData.FromString(planResult is null ? "{}" : "{\"userId\":1,\"weekStart\":\"2026-11-26\"}"));
+        var chatClient = new Mock<ChatClient>();
+        var completions = new Queue<ChatCompletion>(new[]
+        {
+            // This prose precedes the first sensitive call and must also disappear.
+            Completion("Your plan is saved and synced.", ChatToolCall.CreateFunctionToolCall(
+                "read", "GetActivity", BinaryData.FromString("{}"))),
+            Completion("Your plan is saved and synced.", Enumerable.Range(0, toolCount)
+                .Select(i => ChatToolCall.CreateFunctionToolCall($"setup-{i}", setup.FunctionName, setup.FunctionArguments)).ToArray()),
+            Completion("Everything is saved on your watch.", Enumerable.Range(0, planCount)
+                .Select(i => ChatToolCall.CreateFunctionToolCall($"plan-{i}", plan.FunctionName,
+                    replacement && i > 0 ? AssistantScopedReplacementResponseTests.Call("2026-11-27").FunctionArguments : plan.FunctionArguments)).ToArray()),
+            Completion(expectedReply == "Here is your saved-week summary." ? expectedReply : "Your plan was saved and synced successfully.")
+        });
+        chatClient.Setup(c => c.CompleteChatAsync(
+                It.IsAny<IEnumerable<ChatMessage>>(), It.IsAny<ChatCompletionOptions>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(() => ClientResult.FromValue(completions.Dequeue(), new Mock<System.ClientModel.Primitives.PipelineResponse>().Object));
+        var factory = this.mockOpenAIClientFactory.Object;
+        var cache = (System.Collections.Concurrent.ConcurrentDictionary<string, (ChatClient, string, string)>)
+            typeof(OpenAIClientFactory).GetField("chatClients", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(factory)!;
+        cache[""] = (chatClient.Object, "synthetic", "synthetic");
+        cache["OpenAI"] = (chatClient.Object, "synthetic", "synthetic");
+        this.mockSkillInvoker.Setup(i => i.InvokeAsync(It.IsAny<ChatToolCall>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((ChatToolCall call, CancellationToken _) => call.FunctionName == operation && planResult is not null
+                ? replacement && call.FunctionArguments.ToString().Contains("2026-11-27", StringComparison.Ordinal) ? secondReplacementResult : planResult : setupResult);
+        var stored = new List<ChatMessageTableEntity>();
+        this.mockTableClient.Setup(t => t.QueryAsync<TableEntity>(It.IsAny<string>(), null, null, It.IsAny<CancellationToken>()))
+            .Returns(MockAsyncPageable<TableEntity>.Create(new[]
+            {
+                new TableEntity(assistantId, AssistantStateEntity.FixedRowKeyValue)
+                {
+                    ["Exists"] = true, ["CreatedAt"] = DateTime.UtcNow.AddDays(-1),
+                    ["LastUpdatedAt"] = DateTime.UtcNow.AddDays(-1), ["TotalMessages"] = 0, ["TotalTokens"] = 0
+                }
+            }));
+        this.mockTableClient.Setup(t => t.SubmitTransactionAsync(It.IsAny<IEnumerable<TableTransactionAction>>(), It.IsAny<CancellationToken>()))
+            .Callback<IEnumerable<TableTransactionAction>, CancellationToken>((actions, _) =>
+                stored.AddRange(actions.Select(a => a.Entity).OfType<ChatMessageTableEntity>()))
+            .ReturnsAsync(Response.FromValue<IReadOnlyList<Response>>(Array.Empty<Response>(), new Mock<Response>().Object));
+        var service = new DefaultAssistantService(factory, this.mockAzureComponentFactory.Object,
+            this.mockConfiguration.Object, this.mockSkillInvoker.Object, this.mockLoggerFactory.Object);
+        typeof(DefaultAssistantService).GetField("tableClient", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(service, this.mockTableClient.Object);
+
+        var state = await service.PostMessageAsync(attribute, CancellationToken.None);
+
+        if (!enabled)
+        {
+            Assert.Contains(state.RecentMessages, m => m.Content.Contains("saved and synced", StringComparison.Ordinal));
+            return;
+        }
+        if (expectedReply == "Here is your saved-week summary.")
+        {
+            Assert.Contains(state.RecentMessages, m => m.Content == expectedReply);
+            return;
+        }
+        Assert.All(state.RecentMessages, m => Assert.DoesNotContain("saved and synced", m.Content));
+        Assert.All(stored.Where(m => m.Role == "Assistant"), m =>
+        {
+            Assert.DoesNotContain("saved and synced", m.Content);
+            Assert.DoesNotContain("saved on your watch", m.Content);
+        });
+        Assert.Contains(state.RecentMessages, m => m.Content.Replace("\r\n", "\n") == (expectedReply ?? AssistantToolResponsePolicy.UnverifiedResponse));
+        if (planResult is not null)
+            Assert.Contains(stored, m => m.Role == "Assistant" && m.Content.Replace("\r\n", "\n") == expectedReply);
+        this.mockSkillInvoker.Verify(i => i.InvokeAsync(
+            It.Is<ChatToolCall>(call => call.FunctionName == operation), It.IsAny<CancellationToken>()), replacement ? Times.Exactly(planCount)
+                : planResult is null || planCount > 1 || AssistantToolWorkflow.IsFailure(setupResult) ? Times.Never() : Times.Once());
+        var calls = stored.SelectMany(m => m.ToolCalls ?? Array.Empty<ChatToolCall>()).ToList();
+        var results = stored.Where(m => m.Role == "Tool").ToList();
+        Assert.Equal(calls.Select(c => c.Id), results.Select(m => m.Name));
+    }
+
+    static ChatCompletion Completion(string text, params ChatToolCall[] calls) =>
+        OpenAIChatModelFactory.ChatCompletion(
+            id: "synthetic", finishReason: calls.Length == 0 ? ChatFinishReason.Stop : ChatFinishReason.ToolCalls,
+            content: new ChatMessageContent(text), toolCalls: calls,
+            usage: OpenAIChatModelFactory.ChatTokenUsage(1, 1, 2));
 
     static Mock<IConfigurationSection> CreateMockSection(bool exists, string? tableServiceUri = null)
     {

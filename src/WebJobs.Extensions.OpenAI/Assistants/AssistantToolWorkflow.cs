@@ -12,10 +12,50 @@ namespace Microsoft.Azure.WebJobs.Extensions.OpenAI.Assistants;
 internal sealed class AssistantToolWorkflow
 {
     readonly HashSet<string> failedRequests = new(StringComparer.Ordinal);
+    readonly HashSet<string> failedOperations = new(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<string, HashSet<string>> prerequisitesByDependent = new(StringComparer.OrdinalIgnoreCase);
+
+    readonly AssistantPrerequisiteRecovery recovery;
+
+    internal AssistantToolWorkflow(IEnumerable<DependencyRule>? dependencyRules = null, IEnumerable<DependencyRule>? recoveryRules = null)
+    {
+        this.recovery = new(recoveryRules);
+        foreach (DependencyRule rule in dependencyRules ?? Enumerable.Empty<DependencyRule>())
+        {
+            if (string.IsNullOrWhiteSpace(rule.PrerequisiteOperation)
+                || string.IsNullOrWhiteSpace(rule.DependentOperation))
+            {
+                continue;
+            }
+
+            if (!this.prerequisitesByDependent.TryGetValue(rule.DependentOperation, out HashSet<string>? prerequisites))
+            {
+                prerequisites = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                this.prerequisitesByDependent.Add(rule.DependentOperation, prerequisites);
+            }
+
+            prerequisites.Add(rule.PrerequisiteOperation);
+        }
+    }
+
+    internal static IEnumerable<DependencyRule> ParseDependencyRules(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return Enumerable.Empty<DependencyRule>();
+        }
+
+        return value.Split(';')
+            .Select(pair => pair.Split('>', 2))
+            .Where(parts => parts.Length == 2
+                && !string.IsNullOrWhiteSpace(parts[0])
+                && !string.IsNullOrWhiteSpace(parts[1]))
+            .Select(parts => new DependencyRule(parts[0].Trim(), parts[1].Trim()));
+    }
 
     internal async Task<IReadOnlyList<ToolExecution>> ExecuteSequentialAsync(
         IReadOnlyList<ChatToolCall> calls,
-        Func<ChatToolCall, Task<string?>> invokeAsync)
+        Func<ChatToolCall, Task<string?>> invokeAsync, Func<ChatToolCall, bool>? isAllowed = null)
     {
         var executions = new List<ToolExecution>(calls.Count);
         bool failedMutationInBatch = false;
@@ -23,12 +63,30 @@ internal sealed class AssistantToolWorkflow
         {
             string? result;
             ToolExecutionDisposition disposition;
-            if (this.IsDuplicateFailedRequest(call))
+            bool allowed = isAllowed?.Invoke(call) ?? true;
+            bool? recoveryRead = allowed ? this.recovery.Authorize(call) : null;
+            if (!allowed)
+            {
+                result = Newtonsoft.Json.JsonConvert.SerializeObject(new { success = false, operation = call.FunctionName,
+                    outcome = "not_attempted", errorCode = "workflow_context_tool_not_allowed", retryable = false });
+                disposition = ToolExecutionDisposition.ContextBlocked;
+            }
+            else if (recoveryRead == false)
+            {
+                result = RecoveryBlockedResult(call.FunctionName);
+                disposition = ToolExecutionDisposition.DependencyBlocked;
+            }
+            else if (recoveryRead != true && this.IsDuplicateFailedRequest(call))
             {
                 result = DuplicateFailureResult(call.FunctionName);
                 disposition = ToolExecutionDisposition.DuplicateBlocked;
             }
             else if (failedMutationInBatch && IsMutation(call.FunctionName))
+            {
+                result = DependencyFailureResult(call.FunctionName);
+                disposition = ToolExecutionDisposition.DependencyBlocked;
+            }
+            else if (this.HasFailedPrerequisite(call.FunctionName))
             {
                 result = DependencyFailureResult(call.FunctionName);
                 disposition = ToolExecutionDisposition.DependencyBlocked;
@@ -39,24 +97,75 @@ internal sealed class AssistantToolWorkflow
                 disposition = ToolExecutionDisposition.Invoked;
             }
 
-            this.Record(call, result);
+            if (disposition == ToolExecutionDisposition.Invoked)
+                this.Record(call, result);
+            else
+                this.failedOperations.Add(call.FunctionName);
             failedMutationInBatch |= IsMutation(call.FunctionName) && IsFailure(result);
-            executions.Add(new ToolExecution(call, result, disposition));
+            executions.Add(new ToolExecution(call, result, disposition, recoveryRead == true));
         }
 
         return executions;
     }
+
+    internal bool IsRecoveryControlledRead(string operation) => this.recovery.Controls(operation);
 
     internal bool IsDuplicateFailedRequest(ChatToolCall call) =>
         this.failedRequests.Contains(Fingerprint(call));
 
     internal void Record(ChatToolCall call, string? result)
     {
-        if (IsFailure(result))
+        this.recovery.ObserveRepair(call, result);
+        if (this.recovery.Controls(call.FunctionName))
+        {
+            if (this.recovery.ObserveRead(call, result))
+            {
+                this.failedOperations.Remove(call.FunctionName);
+                this.failedRequests.Remove(Fingerprint(call));
+            }
+            else
+            {
+                this.failedOperations.Add(call.FunctionName);
+                this.failedRequests.Add(Fingerprint(call));
+            }
+            return;
+        }
+        bool unverifiedPrerequisite = this.prerequisitesByDependent.Values.Any(names => names.Contains(call.FunctionName))
+            && !IsSuccessfulPrerequisite(result);
+        if (IsFailure(result) || unverifiedPrerequisite)
         {
             this.failedRequests.Add(Fingerprint(call));
+            this.failedOperations.Add(call.FunctionName);
+            return;
         }
+
+        this.failedOperations.Remove(call.FunctionName);
     }
+
+    static bool IsSuccessfulPrerequisite(string? result)
+    {
+        if (ParseResult(result) is not JObject obj
+            || obj.GetValue("success", StringComparison.OrdinalIgnoreCase) is not JValue { Type: JTokenType.Boolean } success
+            || !success.Value<bool>())
+        {
+            return false;
+        }
+        JToken? verified = obj.GetValue("verified", StringComparison.OrdinalIgnoreCase);
+        if (verified is not null && (verified.Type != JTokenType.Boolean || !verified.Value<bool>()))
+        {
+            return false;
+        }
+        JToken? outcome = obj.GetValue("outcome", StringComparison.OrdinalIgnoreCase);
+        // Legacy explicit-success results remain compatible. When supplied, the
+        // outcome must name a known successful transition, never unknown evidence.
+        return outcome is null || (outcome.Type == JTokenType.String
+            && outcome.Value<string>() is "ready" or "saved" or "confirmed" or "success" or "completed");
+    }
+
+    bool HasFailedPrerequisite(string? functionName) =>
+        !string.IsNullOrWhiteSpace(functionName)
+        && this.prerequisitesByDependent.TryGetValue(functionName, out HashSet<string>? prerequisites)
+        && prerequisites.Overlaps(this.failedOperations);
 
     internal static bool IsMutation(string? functionName)
     {
@@ -79,6 +188,11 @@ internal sealed class AssistantToolWorkflow
 
     internal static bool IsFailure(string? result)
     {
+        if (string.IsNullOrWhiteSpace(result))
+        {
+            return true;
+        }
+
         JToken? token = ParseResult(result);
         if (token is JObject obj)
         {
@@ -165,7 +279,29 @@ internal sealed class AssistantToolWorkflow
             assistantInstruction = "A prior write in this batch failed, so this write was not attempted. Repair and verify the failed operation before continuing."
         });
 
-    static JToken? ParseResult(string? result)
+    internal static string RecoveryBlockedResult(string operation) => JsonConvert.SerializeObject(new
+    {
+        success = false, outcome = "prerequisite_recovery_blocked", operation, retryable = false,
+        assistantInstruction = "The read requires a verified repair for the same athlete and identical arguments, and can be retried only once in this turn. Do not repeat writes or claim completion."
+    });
+
+    internal static string MissingResultFailureResult(string functionName) =>
+        JsonConvert.SerializeObject(new
+        {
+            success = false,
+            outcome = "missing_tool_result",
+            errorCode = "missing_tool_result",
+            operation = functionName,
+            retryable = false,
+            assistantInstruction = "The tool returned no result. Treat the operation as unverified: do not claim it was completed, saved, or synced. Re-read the affected state before retrying any write."
+        });
+
+    internal static string NormalizeResult(string functionName, string? result) =>
+        string.IsNullOrWhiteSpace(result)
+            ? MissingResultFailureResult(functionName)
+            : result;
+
+    internal static JToken? ParseResult(string? result)
     {
         if (string.IsNullOrWhiteSpace(result))
         {
@@ -225,12 +361,16 @@ internal sealed class AssistantToolWorkflow
     internal sealed record ToolExecution(
         ChatToolCall Call,
         string? Result,
-        ToolExecutionDisposition Disposition);
+        ToolExecutionDisposition Disposition,
+        bool IsRecoveryRead = false);
+
+    internal sealed record DependencyRule(string PrerequisiteOperation, string DependentOperation);
 
     internal enum ToolExecutionDisposition
     {
         Invoked,
         DuplicateBlocked,
-        DependencyBlocked
+        DependencyBlocked,
+        ContextBlocked
     }
 }

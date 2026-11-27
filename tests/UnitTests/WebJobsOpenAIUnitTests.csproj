@@ -22,8 +22,13 @@
     </PackageReference>
   </ItemGroup>
 
-  <ItemGroup>
+  <ItemGroup Condition="'$(UsePackagedExtension)' != 'true'">
     <ProjectReference Include="..\..\src\WebJobs.Extensions.OpenAI\WebJobs.Extensions.OpenAI.csproj" />
+  </ItemGroup>
+
+  <!-- Exercise the actual packed runtime without a sibling source reference. -->
+  <ItemGroup Condition="'$(UsePackagedExtension)' == 'true'">
+    <PackageReference Include="Streeka.Azure.WebJobs.Extensions.OpenAI" Version="$(ExtensionPackageVersion)" />
   </ItemGroup>
 
 </Project>
